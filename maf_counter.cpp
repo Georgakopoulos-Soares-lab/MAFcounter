@@ -131,8 +131,8 @@ public:
 
     // Producer thread function to process its assigned chunk
     void processChunk(const std::string& filename, std::streampos startPos, std::streampos endPos,
-                      std::vector<moodycamel::ConcurrentQueue<KmerCountsMap>>& kmerGroupQueues,
-                      int threadId) {
+                  std::vector<moodycamel::ConcurrentQueue<KmerCountsMap>>& kmerGroupQueues,
+                  int threadId) {
         std::cout << "[Producer " << threadId << "] Started processing its chunk." << std::endl;
 
         auto chunkStartTime = std::chrono::high_resolution_clock::now();
@@ -178,19 +178,30 @@ public:
                         const std::string& alignedSeq = seqPair.second;
 
                         uint8_t idIndex;
-                        {
-                            std::unique_lock<std::mutex> lock(idMappingMutex);
-                            auto it = idToIndex.find(id);
-                            if (it == idToIndex.end()) {
-                                if (idToIndex.size() >= 254) {
-                                    std::cerr << "Error: Exceeded maximum number of genome IDs (254)." << std::endl;
-                                    exit(1);
+
+                        // Attempt to find the genome ID without locking (not thread-safe)
+                        auto it = idToIndex.find(id);
+                        if (it != idToIndex.end()) {
+                            // Genome ID found, proceed without locking
+                            idIndex = it->second;
+                        } else {
+                            // Lock and double-check
+                            {
+                                std::unique_lock<std::mutex> lock(idMappingMutex);
+                                // Double-check if another thread added the ID
+                                it = idToIndex.find(id);
+                                if (it == idToIndex.end()) {
+                                    if (idToIndex.size() >= 254) {
+                                        std::cerr << "Error: Exceeded maximum number of genome IDs (254)." << std::endl;
+                                        exit(1);
+                                    }
+                                    idIndex = idToIndex.size();
+                                    idToIndex[id] = idIndex;
+                                    indexToId.push_back(id);
+                                } else {
+                                    idIndex = it->second;
                                 }
-                                idIndex = idToIndex.size();
-                                idToIndex[id] = idIndex;
-                                indexToId.push_back(id);
-                            } else {
-                                idIndex = it->second;
+                                // Lock is released when out of scope
                             }
                         }
 
@@ -294,19 +305,30 @@ public:
                 const std::string& alignedSeq = seqPair.second;
 
                 uint8_t idIndex;
-                {
-                    std::unique_lock<std::mutex> lock(idMappingMutex);
-                    auto it = idToIndex.find(id);
-                    if (it == idToIndex.end()) {
-                        if (idToIndex.size() >= 254) {
-                            std::cerr << "Error: Exceeded maximum number of genome IDs (254)." << std::endl;
-                            exit(1);
+
+                // Attempt to find the genome ID without locking (not thread-safe)
+                auto it = idToIndex.find(id);
+                if (it != idToIndex.end()) {
+                    // Genome ID found, proceed without locking
+                    idIndex = it->second;
+                } else {
+                    // Lock and double-check
+                    {
+                        std::unique_lock<std::mutex> lock(idMappingMutex);
+                        // Double-check if another thread added the ID
+                        it = idToIndex.find(id);
+                        if (it == idToIndex.end()) {
+                            if (idToIndex.size() >= 254) {
+                                std::cerr << "Error: Exceeded maximum number of genome IDs (254)." << std::endl;
+                                exit(1);
+                            }
+                            idIndex = idToIndex.size();
+                            idToIndex[id] = idIndex;
+                            indexToId.push_back(id);
+                        } else {
+                            idIndex = it->second;
                         }
-                        idIndex = idToIndex.size();
-                        idToIndex[id] = idIndex;
-                        indexToId.push_back(id);
-                    } else {
-                        idIndex = it->second;
+                        // Lock is released when out of scope
                     }
                 }
 
@@ -378,6 +400,7 @@ public:
         std::cout << "[Producer " << threadId << "] Finished processing its chunk. Time taken: " << chunkDuration << " seconds." << std::endl;
         std::cout << "[Producer " << threadId << "] Total kmers processed: " << localTotalKMersProcessed << std::endl;
     }
+
 
     // Consumer thread function remains unchanged
     void consumeKmerGroups(moodycamel::ConcurrentQueue<KmerCountsMap>& myQueue, int threadId) {

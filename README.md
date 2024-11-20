@@ -28,11 +28,11 @@ g++ -std=c++11 -O3 -o maf_counter maf_counter.cpp -I /path/to/google_sparse_hash
 
 - Extract 15mers from input.maf using 8 producers and 8 consumers ( suitable ideally for 16 processor cores )
 ```
-./maf_counter 15 input.maf 8 
+./maf_counter 15 input.maf 16
 ```
 - The same options but aggregate each kmer with its reverse complement (writing the lexicographically first) and output the results in sinle file mode
 ```
-./maf_counter -c -s 15 input.maf 8
+./maf_counter -c -s 15 input.maf 16
 ```
 ## Output Format
 By default, the tool generates per-genome k-mer files in the results_counter directory. Each file is in Jellyfish format, containing k-mers and their counts for the corresponding genome ID.
