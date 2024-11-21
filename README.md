@@ -13,6 +13,20 @@ To compile MAF Counter, use the following command:
 ```bash
 g++ -std=c++11 -O3 -o maf_counter maf_counter.cpp -I /path/to/google_sparse_hash -I /path/to/concurrent_queue -pthread -lrt
 ```
+
+## Download and Execute MAFcounter binary from releases
+To 
+```bash
+wget https://github.com/Georgakopoulos-Soares-lab/MAFcounter/releases/download/v1.0_linux_x86/maf_counter
+./maf_counter 15 input.maf 16
+```
+
+## Install MAFcounter CLI python wrapper through pip
+```bash
+pip install maf-counter
+maf_counter --help
+```
+
 ## Usage
 ```
 ./maf_counter [options] <k-mer length> <MAF file> <number of threads>
