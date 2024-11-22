@@ -8,10 +8,11 @@ MAF Counter is a multithreaded tool designed to efficiently extract and count k-
 3. **Consumer Merging**: Consumer threads merge k-mer groups into a final aggregated data structure, avoiding conflicts by partitioning based on hashed k-mer keys.
 4. **File Writing**: Once processing is complete, output is written either as per-genome files in Jellyfish format or a single compressed file if the `-s` flag is used.
 
-## Compilation
-To compile MAF Counter, use the following command:
+
+## Install MAFcounter CLI python wrapper through pip
 ```bash
-g++ -std=c++11 -O3 -o maf_counter maf_counter.cpp -I /path/to/google_sparse_hash -I /path/to/concurrent_queue -pthread -lrt
+pip install maf-counter
+maf_counter --help
 ```
 
 ## Download and Execute MAFcounter binary from releases
@@ -21,10 +22,12 @@ wget https://github.com/Georgakopoulos-Soares-lab/MAFcounter/releases/download/v
 ./maf_counter 15 input.maf 16
 ```
 
-## Install MAFcounter CLI python wrapper through pip
+## Compilation ( If you want to make code changes )
+To compile MAF Counter, use the following command after downloading 
+1) Google Sparse Hash ( https://github.com/sparsehash/sparsehash )
+2) Concurrent Queue ( https://github.com/cameron314/concurrentqueue )
 ```bash
-pip install maf-counter
-maf_counter --help
+g++ -std=c++11 -O3 -o maf_counter maf_counter.cpp -I /path/to/google_sparse_hash -I /path/to/concurrent_queue -pthread -lrt
 ```
 
 ## Usage
