@@ -26,7 +26,7 @@ wget https://github.com/Georgakopoulos-Soares-lab/MAFcounter/releases/download/v
 To compile MAF Counter, use the following command after downloading 
 1) Google Sparse Hash ( https://github.com/sparsehash/sparsehash )
 2) Concurrent Queue ( https://github.com/cameron314/concurrentqueue )
-3) Boost Multiprecision CPPInt https://www.boost.org/doc/libs/1_86_0/libs/multiprecision/doc/html/index.html
+3) Boost Multiprecision ( CPPInt https://www.boost.org/doc/libs/1_86_0/libs/multiprecision/doc/html/index.html )
 ```bash
 g++ -std=c++11 -O3 -o maf_counter maf_counter.cpp -I /path/to/google_sparse_hash -I /path/to/concurrent_queue -I /path/to/boost -pthread -lrt
 ```
