@@ -44,6 +44,23 @@ def main():
         action="store_true",
         help="Write all k-mers to a single compressed file."
     )
+    parser.add_argument(
+        "-m", "--max_kmer_count",
+        type=int,
+        choices=[256, 65536, 4294967296],
+        help="Set maximum k-mer count (256, 65536, or 4294967296)"
+    )
+    parser.add_argument(
+        "-l", "--large_genome_count",
+        action="store_true",
+        help="Support more than 256 genomes (up to 65,536)"
+    )
+    parser.add_argument(
+        "-t", "--sequence_type",
+        type=str,
+        choices=['nucleotides', 'amino_acids'],
+        help="Set sequence type ('nucleotides' or 'amino_acids')"
+    )
 
     # Parse the arguments
     args = parser.parse_args()
@@ -55,6 +72,12 @@ def main():
         command.append("-c")
     if args.single_file_output:
         command.append("-s")
+    if args.max_kmer_count:
+        command.extend(["-m", str(args.max_kmer_count)])
+    if args.large_genome_count:
+        command.append("-l")
+    if args.sequence_type:
+        command.extend(["-t", args.sequence_type])
 
     command.extend([str(args.kmer_length), args.maf_file, str(args.threads)])
 
