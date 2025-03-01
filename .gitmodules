@@ -1,0 +1,6 @@
+[submodule "include/boost_multiprecision"]
+	path = include/boost_multiprecision
+	url = https://github.com/boostorg/multiprecision.git
+[submodule "include/boost_config"]
+	path = include/boost_config
+	url = https://github.com/boostorg/config.git
