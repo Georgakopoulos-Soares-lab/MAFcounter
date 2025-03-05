@@ -230,7 +230,7 @@ Examples:
 ```
 
 
-## Data Used for benchmarks
+## Data used for benchmarks
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14927620.svg)](https://doi.org/10.5281/zenodo.14927620)
 
 ## Benchmark Tests Repository
