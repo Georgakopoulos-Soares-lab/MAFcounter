@@ -230,6 +230,12 @@ Examples:
 ```
 
 
+## Data used for benchmarks
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14927620.svg)](https://doi.org/10.5281/zenodo.14927620)
+
+## Benchmark Tests Repository
+https://github.com/Georgakopoulos-Soares-lab/MAFcounter-pipelines
+
 ## License
 This project is licensed under the [GNU GPL v3](LICENSE).
 
