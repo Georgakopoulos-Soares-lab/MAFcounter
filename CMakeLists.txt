@@ -46,31 +46,50 @@ find_package(ZLIB REQUIRED)
 # 1) maf_counter_count
 # ----------------------------------------------------------------------------
 add_executable(maf_counter_count src/maf_counter_count.cpp)
-target_link_libraries(maf_counter_count PRIVATE Threads::Threads ZLIB::ZLIB)
+target_link_libraries(maf_counter_count
+  PRIVATE
+    Threads::Threads
+    ZLIB::ZLIB
+    rt
+)
 
 # ----------------------------------------------------------------------------
 # 2) maf_counter_dump
 # ----------------------------------------------------------------------------
 add_executable(maf_counter_dump src/maf_counter_dump.cpp)
-target_link_libraries(maf_counter_dump PRIVATE Threads::Threads)
+target_link_libraries(maf_counter_dump
+  PRIVATE
+    Threads::Threads
+    rt            # in case it also uses POSIX SHM
+)
 
 # ----------------------------------------------------------------------------
 # 3) maf_counter_tools
 # ----------------------------------------------------------------------------
 add_executable(maf_counter_tools src/maf_counter_tools.cpp)
-# If maf_counter_tools needs zlib as well, link it (uncomment next line if needed):
-target_link_libraries(maf_counter_tools PRIVATE Threads::Threads ZLIB::ZLIB)
+target_link_libraries(maf_counter_tools
+  PRIVATE
+    Threads::Threads
+    ZLIB::ZLIB
+    rt            # if it ever uses shm_open
+)
 
 # ----------------------------------------------------------------------------
 # 4) maf_counter_proteomes_count
 # ----------------------------------------------------------------------------
 add_executable(maf_counter_proteomes_count src/maf_counter_proteomes_count.cpp)
-# Assuming it requires zlib as well (like maf_counter_count)
-target_link_libraries(maf_counter_proteomes_count PRIVATE Threads::Threads ZLIB::ZLIB)
+target_link_libraries(maf_counter_proteomes_count
+  PRIVATE
+    Threads::Threads
+    ZLIB::ZLIB
+)
 
 # ----------------------------------------------------------------------------
 # 5) maf_counter_proteomes_dump
 # ----------------------------------------------------------------------------
 add_executable(maf_counter_proteomes_dump src/maf_counter_proteomes_dump.cpp)
-# Assuming it does NOT use zlib (like maf_counter_dump)
-target_link_libraries(maf_counter_proteomes_dump PRIVATE Threads::Threads)
+target_link_libraries(maf_counter_proteomes_dump
+  PRIVATE
+    Threads::Threads
+
+)

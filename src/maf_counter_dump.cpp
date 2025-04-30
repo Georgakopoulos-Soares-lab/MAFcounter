@@ -14,10 +14,11 @@
 #include <atomic>
 #include <chrono>
 #include <sstream>
-#include <sys/mman.h>   // for mmap
 #include <fcntl.h>      // for open
 #include <unistd.h>     // for close, ftruncate
 #include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 // ------------------- For 128-bit support ---------------------
 #include <boost/multiprecision/cpp_int.hpp>
@@ -36,6 +37,12 @@ static const char BASE_LUT[4] = {'A','C','G','T'};
 static std::array<std::atomic<size_t>, 1024> g_p1SizesAtomic;
 static bool g_decodeByteInited = false;
 static std::array<std::string, 256> g_decodeByte;
+// ------------------------------------------------------------------------
+// Single-threaded, buffered dump for k <= 10 final.bin format
+// ------------------------------------------------------------------------
+static const size_t OUT_BUF_SIZE = 4 << 20; // 4 MiB buffer
+
+
 
 static void initDecodeByte() {
     for (int x = 0; x < 256; x++) {
@@ -110,314 +117,7 @@ struct FileHeader {
     uint8_t  reserved[2];
 };
 
-int doSingleFileOutput(const std::string &finalBinPath, const std::string &optionalOutName)
-{
-    std::ifstream ifs(finalBinPath, std::ios::binary);
-    if (!ifs) {
-        std::cerr << "Cannot open " << finalBinPath << "\n";
-        return 1;
-    }
-    char magic[5];
-    magic[4] = 0;
-    if (!ifs.read(magic, 4)) {
-        std::cerr << "Error reading magic\n";
-        return 1;
-    }
-    if (std::strncmp(magic, "BINF", 4) != 0) {
-        std::cerr << "Not a valid binary format\n";
-        return 1;
-    }
-    int k = 0;
-    if (!ifs.read((char*)&k, sizeof(k))) {
-        std::cerr << "Error reading k\n";
-        return 1;
-    }
-    if (k > KMER_MAX_LENGTH) {
-        std::cerr << "Error: k in file is too large\n";
-        return 1;
-    }
-    uint8_t nIDs = 0;
-    if (!ifs.read((char*)&nIDs, sizeof(nIDs))) {
-        std::cerr << "Error reading nIDs\n";
-        return 1;
-    }
-    std::vector<std::string> genomeNames(nIDs);
-    for (uint8_t i = 0; i < nIDs; i++) {
-        uint16_t len;
-        if (!ifs.read((char*)&len, sizeof(len))) {
-            std::cerr << "Error reading genome name length\n";
-            return 1;
-        }
-        genomeNames[i].resize(len);
-        if (!ifs.read((char*)genomeNames[i].data(), len)) {
-            std::cerr << "Error reading genome name\n";
-            return 1;
-        }
-    }
-    {
-        char sentinelG[5];
-        sentinelG[4] = 0;
-        if (!ifs.read(sentinelG, 4)) {
-            std::cerr << "Error reading sentinel\n";
-            return 1;
-        }
-        if (std::strncmp(sentinelG, "ENDG", 4) != 0) {
-            std::cerr << "Missing ENDG\n";
-            return 1;
-        }
-    }
-    std::string outName = optionalOutName;
-    if (outName.empty()) {
-        outName = "final_sorted_" + std::to_string(k) + "_dump.txt";
-    }
-    std::ofstream ofs(outName);
-    if (!ofs) {
-        std::cerr << "Cannot create " << outName << "\n";
-        return 1;
-    }
 
-    if (k <= 10) {
-        // small K mode
-        uint64_t mapSize = 0;
-        if(!ifs.read((char*)&mapSize, sizeof(mapSize))) {
-            std::cerr << "Error reading map size\n";
-            return 1;
-        }
-        uint64_t totalRead = 0;
-        while (totalRead < mapSize) {
-            uint32_t key32 = 0;
-            if (!ifs.read((char*)&key32, sizeof(key32))) {
-                break;
-            }
-            std::array<uint32_t, 256> arr{};
-            if (!ifs.read((char*)arr.data(), 256*sizeof(uint32_t))) {
-                break;
-            }
-            totalRead++;
-            uint128_t fullVal128 = key32;
-            KmerResult r = decodeKmer128(fullVal128, k);
-            ofs << r.kmer << ": ";
-            bool firstItem = true;
-            for (int g = 0; g < 256; g++) {
-                if (arr[g] > 0) {
-                    if (!firstItem) ofs << ", ";
-                    firstItem = false;
-                    if (g < (int)genomeNames.size())
-                        ofs << genomeNames[g] << ": " << arr[g];
-                    else
-                        ofs << "UnknownID#" << g << ": " << arr[g];
-                }
-            }
-            ofs << "\n";
-        }
-    }
-    else {
-        // big K mode
-        while (true) {
-            char binMagic[5];
-            binMagic[4] = 0;
-            if (!ifs.read(binMagic, 4)) {
-                break;
-            }
-            if (std::strncmp(binMagic, "BINc", 4) != 0) {
-                break;
-            }
-            uint16_t p1 = 0;
-            if(!ifs.read((char*)&p1, sizeof(p1))) {
-                break;
-            }
-            char kmhdMagic[4];
-            if(!ifs.read(kmhdMagic, 4)) {
-                break;
-            }
-            if(std::strncmp(kmhdMagic, "KMHD", 4) != 0) {
-                break;
-            }
-            FileHeader hdr;
-            std::memcpy(hdr.magic, kmhdMagic, 4);
-            if(!ifs.read((char*)&hdr.k,           sizeof(hdr.k)))           break;
-            if(!ifs.read((char*)&hdr.p1_bits,     sizeof(hdr.p1_bits)))     break;
-            if(!ifs.read((char*)&hdr.p2_bits,     sizeof(hdr.p2_bits)))     break;
-            if(!ifs.read((char*)&hdr.genome_id_bits, sizeof(hdr.genome_id_bits))) break;
-            if(!ifs.read((char*)&hdr.suffix_mode, sizeof(hdr.suffix_mode))) break;
-            if(!ifs.read((char*)&hdr.reserved[0], 2)) break;
-
-            char sentinel1[4];
-            if (!ifs.read(sentinel1, 4)) {
-                break;
-            }
-            uint32_t groupCount = 0;
-            if(!ifs.read((char*)&groupCount, sizeof(groupCount))) {
-                break;
-            }
-            struct GMeta {
-                uint16_t p2_val;
-                uint32_t sz;
-            };
-            std::vector<GMeta> metas(groupCount);
-            for(uint32_t i = 0; i < groupCount; i++){
-                if(!ifs.read((char*)&metas[i].p2_val, sizeof(metas[i].p2_val))) break;
-                if(!ifs.read((char*)&metas[i].sz,     sizeof(metas[i].sz)))     break;
-            }
-            char sentinel2[4];
-            if(!ifs.read(sentinel2,4)) {
-                break;
-            }
-
-            int remainder_bits = 2*hdr.k - hdr.p1_bits - hdr.p2_bits;
-
-            auto flushKmer = [&](uint128_t fullVal,
-                                 const std::unordered_map<uint8_t,uint32_t>& gcounts)
-            {
-                KmerResult r = decodeKmer128(fullVal, k);
-                ofs << r.kmer << ": ";
-                bool first = true;
-                for (auto &gc : gcounts){
-                    if(!first) ofs << ", ";
-                    first = false;
-                    if(gc.first < genomeNames.size())
-                        ofs << genomeNames[gc.first] << ": " << gc.second;
-                    else
-                        ofs << "UnknownID#" << (int)gc.first << ": " << gc.second;
-                }
-                ofs << "\n";
-            };
-
-            for(auto &gm : metas){
-                if(gm.sz == 0) continue;
-
-                if(hdr.suffix_mode == 0) {
-                    // suffix in 32 bits
-                    std::vector<uint32_t> arr(gm.sz);
-                    if(!ifs.read((char*)arr.data(), gm.sz*sizeof(uint32_t))) {
-                        break;
-                    }
-                    bool first = true;
-                    uint128_t currVal = 0;
-                    std::unordered_map<uint8_t,uint32_t> gcounts;
-                    for(auto v : arr){
-                        uint8_t gID   = (uint8_t)(v & 0xFF);
-                        uint64_t rem  = (v >> 8);
-                        uint128_t fullVal = p1;
-                        fullVal <<= (hdr.p2_bits + remainder_bits);
-                        fullVal |= ((uint128_t)gm.p2_val << remainder_bits);
-                        fullVal |= rem;
-                        if(first){
-                            first = false;
-                            currVal = fullVal;
-                            gcounts.clear();
-                            gcounts[gID] = 1;
-                        } else {
-                            if(fullVal == currVal){
-                                gcounts[gID]++;
-                            } else {
-                                flushKmer(currVal, gcounts);
-                                currVal = fullVal;
-                                gcounts.clear();
-                                gcounts[gID] = 1;
-                            }
-                        }
-                    }
-                    if(!first){
-                        flushKmer(currVal, gcounts);
-                    }
-                }
-                else if(hdr.suffix_mode == 1) {
-                    // suffix in 64 bits
-                    std::vector<uint64_t> arr(gm.sz);
-                    if(!ifs.read((char*)arr.data(), gm.sz*sizeof(uint64_t))) {
-                        break;
-                    }
-                    bool first = true;
-                    uint128_t currVal = 0;
-                    std::unordered_map<uint8_t,uint32_t> gcounts;
-                    for(auto v : arr){
-                        uint8_t gID = (uint8_t)(v & 0xFF);
-                        uint64_t rem = (v >> 8);
-                        uint128_t fullVal = p1;
-                        fullVal <<= (hdr.p2_bits + remainder_bits);
-                        fullVal |= ((uint128_t)gm.p2_val << remainder_bits);
-                        fullVal |= rem;
-                        if(first){
-                            first = false;
-                            currVal = fullVal;
-                            gcounts.clear();
-                            gcounts[gID] = 1;
-                        } else {
-                            if(fullVal == currVal){
-                                gcounts[gID]++;
-                            } else {
-                                flushKmer(currVal, gcounts);
-                                currVal = fullVal;
-                                gcounts.clear();
-                                gcounts[gID] = 1;
-                            }
-                        }
-                    }
-                    if(!first){
-                        flushKmer(currVal, gcounts);
-                    }
-                }
-                else if(hdr.suffix_mode == 3) {
-                    // suffix in 128 bits
-                    // We'll read each record as two uint64_t = total 128 bits.
-                    std::vector<std::array<uint64_t,2>> arr(gm.sz);
-                    if(!ifs.read((char*)arr.data(), gm.sz*2*sizeof(uint64_t))) {
-                        break;
-                    }
-                    bool first = true;
-                    uint128_t currVal = 0;
-                    std::unordered_map<uint8_t,uint32_t> gcounts;
-                    for(auto &v : arr){
-                        // lower 8 bits of v[0] = genome ID
-                        uint8_t gID = (uint8_t)(v[0] & 0xFF);
-                        // next 120 bits are remainder
-                        uint128_t rem = (( (uint128_t)v[1]) << 56) | ((v[0] >> 8) & 0x00FFFFFFFFFFFFFFULL);
-
-                        uint128_t fullVal = p1;
-                        fullVal <<= (hdr.p2_bits + remainder_bits);
-                        fullVal |= ((uint128_t)gm.p2_val << remainder_bits);
-                        fullVal |= rem;
-
-                        if(first) {
-                            first = false;
-                            currVal = fullVal;
-                            gcounts.clear();
-                            gcounts[gID] = 1;
-                        } else {
-                            if(fullVal == currVal) {
-                                gcounts[gID]++;
-                            } else {
-                                flushKmer(currVal, gcounts);
-                                currVal = fullVal;
-                                gcounts.clear();
-                                gcounts[gID] = 1;
-                            }
-                        }
-                    }
-                    if(!first){
-                        flushKmer(currVal, gcounts);
-                    }
-                }
-                else {
-                    // unknown suffix_mode
-                    std::cerr << "Unknown suffix_mode encountered.\n";
-                    return 1;
-                }
-            }
-            char bend[5];
-            bend[4] = 0;
-            if(!ifs.read(bend,4)){
-                break;
-            }
-            if(std::strncmp(bend,"BEND",4)!=0){
-                break;
-            }
-        }
-    }
-    ofs.close();
-    return 0;
-}
 
 struct NextRecord {
     bool      valid;
@@ -548,13 +248,22 @@ private:
     {
         while(true){
             if(m_eof) return {false,0,0,0};
-            if(m_mapReadCount>=m_mapSize){
-                char endm[4];
-                m_ifs.read(endm,4);
-                m_eof=true;
-                return {false,0,0,0};
-            }
-            if(m_idx>=256){
+
+            // ----------------------------------------------------------
+            // Have we finished the current 256-counter slab?
+            // If yes, either load the next key or declare true EOF.
+            // ----------------------------------------------------------
+            if (m_idx >= 256) {
+                    /* Reached the end of the current counter array.
+                     * If we have already read every key, this *really* is EOF;
+                     * otherwise read the next <key + 256 counters> block.    */
+    
+                    if (m_mapReadCount == m_mapSize) {
+                        char endm[4];
+                        m_ifs.read(endm, 4);          // "ENDM"
+                        m_eof = true;
+                        return {false,0,0,0};
+                    }
                 uint32_t key32=0;
                 if(!m_ifs.read((char*)&key32,sizeof(key32))){
                     m_eof=true;
@@ -763,129 +472,8 @@ static size_t computeLineSize(const std::string &kmerStr,
     return lineSize;
 }
 
-static void p1SizeComputerWorker(int threadID,
-                                 uint16_t p1Start,
-                                 uint16_t p1End,
-                                 const std::string &finalBinPath,
-                                 const std::vector<std::string> &genomeNames,
-                                 int k,
-                                 uint8_t nIDs)
-{
-    FinalBinReader reader(finalBinPath, k, p1Start, p1End);
-    if(!reader.good()) return;
-    bool haveCurr=false;
-    uint128_t currKmer=0;
-    std::vector<uint32_t> counts(nIDs,0);
-    auto flushKmer = [&](uint128_t km){
-        std::unordered_map<uint8_t,uint32_t> gmap;
-        for(uint8_t gid=0;gid<nIDs;gid++){
-            if(counts[gid]>0){
-                gmap[gid]=counts[gid];
-            }
-        }
-        if(gmap.empty()) return;
-        KmerResult r=decodeKmer128(km,k);
-        size_t lineBytes=computeLineSize(r.kmer,gmap,genomeNames);
-        uint16_t p1Val=getP1Range(km,k);
-        g_p1SizesAtomic[p1Val].fetch_add(lineBytes,std::memory_order_relaxed);
-    };
-    while(true){
-        NextRecord nr=reader.getNext();
-        if(!nr.valid){
-            if(haveCurr) flushKmer(currKmer);
-            break;
-        }
-        if(!haveCurr){
-            haveCurr=true;
-            currKmer=nr.kmer;
-            std::fill(counts.begin(),counts.end(),0);
-            counts[nr.genomeID]+=nr.count;
-        } else {
-            if(nr.kmer==currKmer){
-                counts[nr.genomeID]+=nr.count;
-            } else {
-                flushKmer(currKmer);
-                currKmer=nr.kmer;
-                std::fill(counts.begin(),counts.end(),0);
-                counts[nr.genomeID]+=nr.count;
-            }
-        }
-    }
-}
 
-int computeLineSizesSingleFileKmer(const std::string &finalBinPath, int numThreads)
-{
-    std::ifstream ifs(finalBinPath, std::ios::binary);
-    if(!ifs){
-        std::cerr<<"Cannot open "<<finalBinPath<<"\n";
-        return 1;
-    }
-    {
-        char mg[4];
-        if(!ifs.read(mg,4)){return 1;}
-        if(std::strncmp(mg,"BINF",4)!=0){
-            return 1;
-        }
-    }
-    int k=0;
-    if(!ifs.read((char*)&k,sizeof(k))){
-        return 1;
-    }
-    if(k<=0 || k>KMER_MAX_LENGTH){
-        return 1;
-    }
-    uint8_t nIDs=0;
-    if(!ifs.read((char*)&nIDs,sizeof(nIDs))){
-        return 1;
-    }
-    std::vector<std::string> genomeNames(nIDs);
-    for(uint8_t i=0;i<nIDs;i++){
-        uint16_t len=0;
-        if(!ifs.read((char*)&len,sizeof(len))){return 1;}
-        genomeNames[i].resize(len);
-        if(!ifs.read((char*)genomeNames[i].data(),len)){return 1;}
-    }
-    {
-        char endg[4];
-        if(!ifs.read(endg,4)){return 1;}
-        if(std::strncmp(endg,"ENDG",4)!=0){
-            return 1;
-        }
-    }
-    ifs.close();
-    for(auto &x:g_p1SizesAtomic){
-        x.store(0,std::memory_order_relaxed);
-    }
-    int totalP1=(1<<P1_BITS);
-    if(numThreads<1) numThreads=1;
-    int chunkSize=(totalP1+numThreads-1)/numThreads;
-    std::vector<ThreadRange> thrRanges(numThreads);
-    for(int i=0;i<numThreads;i++){
-        uint16_t start=(uint16_t)(i*chunkSize);
-        uint16_t end=(uint16_t)std::min<int>((i+1)*chunkSize-1,totalP1-1);
-        thrRanges[i]={start,end};
-    }
-    std::vector<std::thread> threads;
-    threads.reserve(numThreads);
-    for(int t=0;t<numThreads;t++){
-        threads.emplace_back(p1SizeComputerWorker,t,
-                             thrRanges[t].p1Start,thrRanges[t].p1End,
-                             finalBinPath,std::cref(genomeNames),k,nIDs);
-    }
-    for(auto &th:threads){
-        th.join();
-    }
-    size_t totalBytes=0;
-    for(int i=0;i<1024;i++){
-        totalBytes+= g_p1SizesAtomic[i].load(std::memory_order_relaxed);
-    }
-    std::cout<<"[computeLineSizesSingleFileKmer] Estimated total bytes = "<<totalBytes<<"\n";
-    return 0;
-}
 
-// ----------------------------------------------------------------------------------
-// doSingleFileOutputWithMmap (uses line-size computation + parallel write)
-// ----------------------------------------------------------------------------------
 
 static std::vector<size_t> g_p1Offsets(1025);
 
@@ -942,208 +530,511 @@ static void buildLine(char *dest,
     dest[written++]='\n';
 }
 
-static void p1WriteWorker(int threadID,
-                          uint16_t p1Start,
-                          uint16_t p1End,
-                          const std::string &finalBinPath,
-                          const std::vector<std::string> &genomeNames,
-                          int k,
-                          uint8_t nIDs,
-                          char *mappedPtr)
+// ------------------------------------------------------------
+// Globals for write-pass coordination
+// ------------------------------------------------------------
+static std::mutex    g_writeMux;
+static size_t        g_writeCursor = 0;
+
+// Helper: build one output line into a std::string
+static std::string buildLineString(const std::string &kmer,
+                                   const std::unordered_map<uint8_t,uint32_t> &gcounts)
 {
-    FinalBinReader reader(finalBinPath, k, p1Start, p1End);
-    if(!reader.good()) return;
-
-    bool haveCurr=false;
-    uint128_t currKmer=0;
-    std::vector<uint32_t> counts(nIDs,0);
-
-    auto flushKmer=[&](uint128_t km){
-        std::unordered_map<uint8_t,uint32_t> gmap;
-        for(uint8_t gid=0;gid<nIDs;gid++){
-            if(counts[gid]>0) gmap[gid]=counts[gid];
-        }
-        if(gmap.empty()) return;
-        KmerResult r=decodeKmer128(km,k);
-        size_t lineLen=computeLineSize(r.kmer,gmap,genomeNames);
-        uint16_t p1Val=getP1Range(km,k);
-        size_t offset=g_p1Offsets[p1Val];
-        buildLine(mappedPtr, r.kmer, gmap, genomeNames, offset);
-        g_p1Offsets[p1Val]=offset;
-    };
-
-    while(true){
-        NextRecord nr=reader.getNext();
-        if(!nr.valid){
-            if(haveCurr) flushKmer(currKmer);
-            break;
-        }
-        if(!haveCurr){
-            haveCurr=true;
-            currKmer=nr.kmer;
-            std::fill(counts.begin(),counts.end(),0);
-            counts[nr.genomeID]+=nr.count;
+    std::string line;
+    // reserve roughly: k + 2 + (#entries)*(name+4+digits+2) + 1
+    line.reserve(kmer.size() + 2 + gcounts.size()*16 + 1);
+    line += kmer;
+    line += ": ";
+    bool first = true;
+    for (auto &kv : gcounts) {
+        if (kv.second == 0) continue;
+        if (!first) line += ", ";
+        first = false;
+        uint8_t gid = kv.first;
+        if (gid < g_genomeNames.size()) {
+            line += g_genomeNames[gid];
         } else {
-            if(nr.kmer==currKmer){
-                counts[nr.genomeID]+=nr.count;
+            line += "UnknownID#";
+            line += std::to_string(gid);
+        }
+        line += ": ";
+        line += std::to_string(kv.second);
+    }
+    line += '\n';
+    return line;
+}
+
+
+static std::vector<std::pair<uint16_t,uint64_t>> readP1Metadata(const std::string& metadataFile) {
+    std::vector<std::pair<uint16_t,uint64_t>> meta;
+    std::ifstream metaIn(metadataFile);
+    if (!metaIn) {
+        std::cerr << "Error opening metadata file: " << metadataFile << "\n";
+        return meta;
+    }
+    uint16_t p1;
+    uint64_t off;
+    while (metaIn >> p1 >> off) {
+        meta.emplace_back(p1, off);
+    }
+    std::sort(meta.begin(), meta.end(),
+              [](auto &a, auto &b){ return a.first < b.first; });
+    return meta;
+}
+
+// ------------------------------------------------------------------------
+// Worker #1 (prediction pass): for each assigned p1, seek into final.bin
+// and compute the byte‐size of every line *without* calling decodeKmer128.
+// ------------------------------------------------------------------------
+static void p1SizePredWorker(int threadID,
+                             const std::vector<uint16_t>& p1List,
+                             const std::string& finalBinPath,
+                             int k, uint8_t nIDs)
+{
+    for (uint16_t p1 : p1List) {
+        FinalBinReader reader(finalBinPath, k, p1, p1);
+        if (!reader.good()) continue;
+
+        bool haveCurr = false;
+        uint128_t currKmer = 0;
+        std::vector<uint32_t> counts(nIDs, 0);
+
+        // same logic as before, but compute length by arithmetic only
+        auto flush = [&](uint128_t) {
+            size_t lineBytes = k + 2; // kmer + ": "
+            bool first = true;
+            for (uint8_t gid = 0; gid < nIDs; ++gid) {
+                uint32_t c = counts[gid];
+                if (c == 0) continue;
+                if (!first) lineBytes += 2; // ", "
+                first = false;
+                const std::string &nm = (gid < g_genomeNames.size()
+                                         ? g_genomeNames[gid]
+                                         : "UnknownID#" + std::to_string(gid));
+                lineBytes += nm.size() + 2;  // name + ": "
+                lineBytes += digitCount(c);
+            }
+            lineBytes += 1; // newline
+            g_p1SizesAtomic[p1].fetch_add(lineBytes,
+                                          std::memory_order_relaxed);
+        };
+
+        while (true) {
+            NextRecord nr = reader.getNext();
+            if (!nr.valid) {
+                if (haveCurr) flush(currKmer);
+                break;
+            }
+            if (!haveCurr) {
+                haveCurr = true;
+                currKmer = nr.kmer;
+                std::fill(counts.begin(), counts.end(), 0);
+                counts[nr.genomeID] += nr.count;
+            } else if (nr.kmer == currKmer) {
+                counts[nr.genomeID] += nr.count;
             } else {
-                flushKmer(currKmer);
-                currKmer=nr.kmer;
-                std::fill(counts.begin(),counts.end(),0);
-                counts[nr.genomeID]+=nr.count;
+                flush(currKmer);
+                currKmer = nr.kmer;
+                std::fill(counts.begin(), counts.end(), 0);
+                counts[nr.genomeID] += nr.count;
             }
         }
     }
 }
 
-int doSingleFileOutputWithMmap(const std::string &finalBinPath,
-                               const std::string &optionalOutName,
-                               int numThreads)
+// ------------------------------------------------------------------------
+// Revised computeLineSizesSingleFileKmer: 
+//   • reads the header (k, nIDs, names… same as before)
+//   • reads & sorts final.metadata
+//   • round-robins p1 IDs across threads
+//   • runs prediction workers
+//   • computes g_p1Offsets[] and totalBytes
+// ------------------------------------------------------------------------
+int computeLineSizesSingleFileKmer(const std::string &finalBinPath,
+                                   int numThreads)
 {
+    // --- parse header (exactly as your old code did) ---
     std::ifstream ifs(finalBinPath, std::ios::binary);
-    if(!ifs){
-        std::cerr<<"Cannot open "<<finalBinPath<<"\n";
+    if (!ifs) {
+        std::cerr << "Cannot open " << finalBinPath << "\n";
         return 1;
     }
-    {
-        char mg[4];
-        if(!ifs.read(mg,4)) {
-            std::cerr<<"Error reading magic\n";
-            return 1;
-        }
-        if(std::strncmp(mg,"BINF",4)!=0){
-            std::cerr<<"Not a BINF\n";
-            return 1;
-        }
-    }
-    int k=0;
-    if(!ifs.read((char*)&k,sizeof(k))){
-        std::cerr<<"Error reading k\n";
+    // --- parse header so we get k, nIDs and genome names ---
+    char magic[4];
+    if (!ifs.read(magic,4) || std::strncmp(magic,"BINF",4)!=0) {
+        std::cerr<<"Bad magic in "<<finalBinPath<<"\n";
         return 1;
     }
-    if(k> KMER_MAX_LENGTH){
-        std::cerr<<"k in file is too large\n";
+    int k = 0;
+    if (!ifs.read((char*)&k,sizeof(k)) || k <= 0 || k > KMER_MAX_LENGTH) {
+        std::cerr<<"Bad k in header\n";
         return 1;
     }
-    uint8_t nIDs=0;
-    if(!ifs.read((char*)&nIDs,sizeof(nIDs))){
-        std::cerr<<"Error reading nIDs\n";
+    uint8_t nIDs = 0;
+    if (!ifs.read((char*)&nIDs,sizeof(nIDs))) {
+        std::cerr<<"Bad nIDs in header\n";
         return 1;
     }
-    std::vector<std::string> genomeNames(nIDs);
-    for(uint8_t i=0;i<nIDs;i++){
-        uint16_t len=0;
-        if(!ifs.read((char*)&len,sizeof(len))){
+    g_genomeNames.resize(nIDs);
+    for (uint8_t i = 0; i < nIDs; ++i) {
+        uint16_t len = 0;
+        if (!ifs.read((char*)&len,sizeof(len))) {
             std::cerr<<"Error reading genome name length\n";
             return 1;
         }
-        genomeNames[i].resize(len);
-        if(!ifs.read((char*)genomeNames[i].data(),len)){
+        g_genomeNames[i].resize(len);
+        if (!ifs.read(g_genomeNames[i].data(),len)) {
             std::cerr<<"Error reading genome name\n";
             return 1;
         }
     }
-    {
-        char endg[4];
-        if(!ifs.read(endg,4)){
-            std::cerr<<"Error reading ENDG\n";
-            return 1;
-        }
-        if(std::strncmp(endg,"ENDG",4)!=0){
-            std::cerr<<"Missing ENDG\n";
-            return 1;
-        }
-    }
-    ifs.close();
-
-    for(auto &x:g_p1SizesAtomic){
-        x.store(0,std::memory_order_relaxed);
-    }
-    int totalP1=(1<<P1_BITS);
-    if(numThreads<1) numThreads=1;
-    int chunkSize=(totalP1+numThreads-1)/numThreads;
-    std::vector<ThreadRange> thrRanges(numThreads);
-    for(int i=0;i<numThreads;i++){
-        uint16_t start=(uint16_t)(i*chunkSize);
-        uint16_t end= (uint16_t)std::min<int>((i+1)*chunkSize-1,totalP1-1);
-        thrRanges[i]={start,end};
+    char endg[4];
+    if (!ifs.read(endg,4) || std::strncmp(endg,"ENDG",4)!=0) {
+        std::cerr<<"Missing ENDG sentinel\n";
+        return 1;
     }
 
-    // First pass: compute line sizes
-    {
-        std::vector<std::thread> threads;
-        threads.reserve(numThreads);
-        for(int t=0;t<numThreads;t++){
-            threads.emplace_back(p1SizeComputerWorker,t,
-                                 thrRanges[t].p1Start,thrRanges[t].p1End,
-                                 finalBinPath,std::cref(genomeNames),
-                                 k,nIDs);
-        }
-        for(auto &th:threads){
-            th.join();
-        }
-    }
-    // Compute prefix sums
-    size_t totalBytes=0;
-    for(int i=0;i<1024;i++){
-        size_t sz=g_p1SizesAtomic[i].load(std::memory_order_relaxed);
-        g_p1Offsets[i]=totalBytes;
-        totalBytes+=sz;
-    }
-    g_p1Offsets[1024]=totalBytes;
 
-    std::string outName= optionalOutName;
-    if(outName.empty()){
-        outName="final_sorted_"+std::to_string(k)+"_dump.txt";
+    // --- read & sort metadata ---
+    auto meta = readP1Metadata("final.metadata");
+    if (meta.empty()) {
+        std::cerr << "No metadata entries found\n";
+        return 1;
     }
 
-    // Create the file
-    {
-        int fd=open(outName.c_str(), O_RDWR|O_CREAT, 0666);
-        if(fd<0){
-            std::cerr<<"Cannot create "<<outName<<"\n";
-            return 1;
-        }
-        if(ftruncate(fd, totalBytes)!=0){
-            std::cerr<<"ftruncate failed: "<<errno<<"\n";
-            close(fd);
-            return 1;
-        }
-        void* mapPtr=mmap(nullptr, totalBytes, PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-        if(mapPtr==MAP_FAILED){
-            std::cerr<<"mmap failed: "<<errno<<"\n";
-            close(fd);
-            return 1;
-        }
-        char *mappedPtr=(char*)mapPtr;
-
-        // Second pass: write lines
-        {
-            std::vector<std::thread> threads;
-            threads.reserve(numThreads);
-            for(int t=0;t<numThreads;t++){
-                threads.emplace_back(p1WriteWorker,t,
-                                     thrRanges[t].p1Start,thrRanges[t].p1End,
-                                     finalBinPath,std::cref(genomeNames),
-                                     k,nIDs,
-                                     mappedPtr);
-            }
-            for(auto &th:threads){
-                th.join();
-            }
-        }
-
-        msync(mappedPtr,totalBytes,MS_SYNC);
-        munmap(mappedPtr,totalBytes);
-        close(fd);
+    // --- distribute p1 values round-robin to each thread ---
+    std::vector<std::vector<uint16_t>> threadP1(numThreads);
+    for (size_t i = 0; i < meta.size(); ++i) {
+        threadP1[i % numThreads].push_back(meta[i].first);
     }
-    std::cout<<"Created single-file text output of size "<<totalBytes<<" bytes.\n";
+
+    // reset atomics
+    for (auto &x : g_p1SizesAtomic)
+        x.store(0, std::memory_order_relaxed);
+
+    // launch prediction threads
+    std::vector<std::thread> threads;
+    threads.reserve(numThreads);
+    for (int t = 0; t < numThreads; ++t) {
+        threads.emplace_back(p1SizePredWorker, t,
+                             std::cref(threadP1[t]),
+                             std::cref(finalBinPath),
+                             k, nIDs);
+    }
+    for (auto &th : threads) th.join();
+
+    // build offsets & compute total
+    size_t totalBytes = 0;
+    for (auto &e : meta) {
+        uint16_t p1 = e.first;
+        g_p1Offsets[p1] = totalBytes;
+        totalBytes += g_p1SizesAtomic[p1]
+                          .load(std::memory_order_relaxed);
+    }
+    // sentinel at end:
+    g_p1Offsets[meta.size()] = totalBytes;
+
+    std::cout << "[computeLineSizesSingleFileKmer] Estimated total bytes = "
+              << totalBytes << "\n";
     return 0;
 }
 
-// ------------------------------------------------------------
-// doMultipleFilesOutput
-// ------------------------------------------------------------
+// ------------------------------------------------------------------------
+// Worker #2: batch each P1 into one big buffer, then write it in one shot.
+// ------------------------------------------------------------------------
+static void p1WriteWorker(int threadID,
+    const std::vector<uint16_t> &p1List,
+    const std::string &finalBinPath,
+    int k,
+    uint8_t nIDs,
+    const std::string &outName)
+{
+    std::ofstream ofs(outName, std::ios::in|std::ios::out|std::ios::binary);
+    if (!ofs) {
+        std::cerr<<"Cannot open "<<outName<<" for writing\n";
+        return;
+    }
+
+    for (uint16_t p1 : p1List) {
+        // 1) grab this region’s starting offset
+        size_t partSize = g_p1SizesAtomic[p1].load(std::memory_order_relaxed);
+
+        // --- Allocate and reserve exactly the needed bytes for this P1 block ---
+        std::string p1Buffer;
+        p1Buffer.reserve(partSize);
+
+        size_t writeOffset;
+        {
+            std::lock_guard<std::mutex> lk(g_writeMux);
+            writeOffset   = g_writeCursor;
+            g_writeCursor += partSize;
+        }
+
+        // 2) stream through only that p1
+        FinalBinReader reader(finalBinPath, k, p1, p1);
+        if (!reader.good()) continue;
+
+        bool haveCurr = false;
+        uint128_t currKmer = 0;
+        std::vector<uint32_t> counts(nIDs,0);
+
+        // buildLineString() returns the full line including newline
+        auto flush = [&](uint128_t km) {
+            // collect non-zero counts
+            std::unordered_map<uint8_t,uint32_t> gmap;
+            for (uint8_t g = 0; g < nIDs; ++g) {
+                if (counts[g] > 0) gmap[g] = counts[g];
+            }
+            if (gmap.empty()) return;
+
+            // build the single line
+            KmerResult r = decodeKmer128(km, k);
+            std::string line = buildLineString(r.kmer, gmap);
+
+            // append into our big buffer
+            p1Buffer += line;
+        };
+
+        // read & flush groups
+        while (true) {
+            NextRecord nr = reader.getNext();
+            if (!nr.valid) {
+                if (haveCurr) flush(currKmer);
+                break;
+            }
+            if (!haveCurr) {
+                haveCurr = true;
+                currKmer = nr.kmer;
+                std::fill(counts.begin(), counts.end(), 0);
+                counts[nr.genomeID] += nr.count;
+            }
+            else if (nr.kmer == currKmer) {
+                counts[nr.genomeID] += nr.count;
+            }
+            else {
+                flush(currKmer);
+                currKmer = nr.kmer;
+                std::fill(counts.begin(), counts.end(), 0);
+                counts[nr.genomeID] += nr.count;
+            }
+        }
+
+        // 3) write the entire P1 block in one syscall
+        ofs.seekp(writeOffset, std::ios::beg);
+        ofs.write(p1Buffer.data(), p1Buffer.size());
+    }
+}
+int doSingleFileSmallKmer(const std::string &finalBinPath,
+    const std::string &outName)
+{
+// 1) Open and parse header
+std::ifstream ifs(finalBinPath, std::ios::binary);
+if (!ifs) {
+std::cerr << "Cannot open " << finalBinPath << "\n";
+return 1;
+}
+
+// magic
+char magic[4];
+ifs.read(magic, 4);
+if (std::strncmp(magic, "BINF", 4) != 0) {
+std::cerr << "Bad magic in " << finalBinPath << "\n";
+return 1;
+}
+
+// k
+int k = 0;
+ifs.read(reinterpret_cast<char*>(&k), sizeof(k));
+
+// nIDs
+uint8_t nIDs = 0;
+ifs.read(reinterpret_cast<char*>(&nIDs), sizeof(nIDs));
+
+// --- READ genome names into g_genomeNames! ---
+g_genomeNames.clear();
+g_genomeNames.resize(nIDs);
+for (uint8_t i = 0; i < nIDs; ++i) {
+uint16_t len = 0;
+ifs.read(reinterpret_cast<char*>(&len), sizeof(len));
+std::string nm(len, '\0');
+ifs.read(&nm[0], len);
+g_genomeNames[i] = std::move(nm);
+}
+
+// skip ENDG sentinel
+ifs.ignore(4);
+
+// skip the mapSize (uint64_t)
+uint64_t mapSize = 0;
+ifs.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+// 2) Prepare reader and output
+FinalBinReader reader(finalBinPath, k, 0, (1u << P1_BITS) - 1);
+if (!reader.good()) {
+std::cerr << "Error initializing reader\n";
+return 1;
+}
+
+std::ofstream ofs(outName);
+if (!ofs) {
+std::cerr << "Cannot create " << outName << "\n";
+return 1;
+}
+
+std::string buffer;
+buffer.reserve(OUT_BUF_SIZE);
+
+// 3) Iterate NextRecord, grouping by kmer
+uint128_t currKmer = 0;
+bool haveCurr = false;
+std::vector<uint32_t> counts(nIDs, 0);
+
+auto flush_line = [&]() {
+KmerResult kr = decodeKmer128(currKmer, k);
+buffer += kr.kmer;
+buffer += ": ";
+bool first = true;
+for (uint8_t gid = 0; gid < nIDs; ++gid) {
+if (counts[gid] == 0){
+     continue;}
+if (!first) buffer += ", ";
+first = false;
+buffer += g_genomeNames[gid];
+buffer += ": ";
+buffer += std::to_string(counts[gid]);
+}
+buffer += '\n';
+if (buffer.size() >= OUT_BUF_SIZE) {
+ofs << buffer;
+buffer.clear();
+}
+};
+
+while (true) {
+NextRecord nr = reader.getNext();
+if (!nr.valid) {
+if (haveCurr) flush_line();
+break;
+}
+if (!haveCurr || nr.kmer != currKmer) {
+if (haveCurr) flush_line();
+currKmer = nr.kmer;
+std::fill(counts.begin(), counts.end(), 0);
+haveCurr = true;
+}
+counts[nr.genomeID] += nr.count;
+}
+
+if (!buffer.empty()) ofs << buffer;
+std::cout << "Created single-file dump: " << outName << "\n";
+return 0;
+}
+
+
+
+// ------------------------------------------------------------------------
+// Updated doSingleFileOutputWithMmap → single-file write using threads + ofs
+// ------------------------------------------------------------------------
+int doSingleFileOutputWithMmap(const std::string &finalBinPath,
+    const std::string &optionalOutName,
+    int numThreads)
+{
+// --- 1) parse header exactly as before to get k, nIDs, g_genomeNames[] ---
+std::ifstream ifs(finalBinPath, std::ios::binary);
+if (!ifs) {
+std::cerr<<"Cannot open "<<finalBinPath<<"\n";
+return 1;
+}
+    // --- parse header so we get k, nIDs and genome names ---
+    char magic[4];
+    if (!ifs.read(magic,4) || std::strncmp(magic,"BINF",4)!=0) {
+        std::cerr<<"Bad magic in "<<finalBinPath<<"\n";
+        return 1;
+    }
+    int k = 0;
+    if (!ifs.read((char*)&k,sizeof(k)) || k <= 0 || k > KMER_MAX_LENGTH) {
+        std::cerr<<"Bad k in header\n";
+        return 1;
+    }
+    uint8_t nIDs = 0;
+    if (!ifs.read((char*)&nIDs,sizeof(nIDs))) {
+        std::cerr<<"Bad nIDs in header\n";
+        return 1;
+    }
+    g_genomeNames.resize(nIDs);
+    for (uint8_t i = 0; i < nIDs; ++i) {
+        uint16_t len = 0;
+        if (!ifs.read((char*)&len,sizeof(len))) {
+            std::cerr<<"Error reading genome name length\n";
+            return 1;
+        }
+        g_genomeNames[i].resize(len);
+        if (!ifs.read(g_genomeNames[i].data(),len)) {
+            std::cerr<<"Error reading genome name\n";
+            return 1;
+        }
+    }
+    char endg[4];
+    if (!ifs.read(endg,4) || std::strncmp(endg,"ENDG",4)!=0) {
+        std::cerr<<"Missing ENDG sentinel\n";
+        return 1;
+    }
+
+
+// --- 2) prediction pass (same as Part 1) ---
+if (computeLineSizesSingleFileKmer(finalBinPath, numThreads) != 0)
+return 1;
+
+// --- 3) decide output file name ---
+std::string outName = optionalOutName.empty()
+ ? ("final_sorted_" + std::to_string(k) + "_dump.txt")
+ : optionalOutName;
+
+// --- 4) create & truncate to total size ---
+// total size = sum of all g_p1SizesAtomic[p1] = g_writeCursor after computeLineSizes,
+// or recompute as:
+size_t totalBytes = 0;
+auto meta = readP1Metadata("final.metadata");
+for (auto &e : meta)
+totalBytes += g_p1SizesAtomic[e.first].load(std::memory_order_relaxed);
+
+int fd = open(outName.c_str(), O_RDWR|O_CREAT, 0666);
+if (fd < 0) {
+std::cerr<<"Cannot create "<<outName<<"\n";
+return 1;
+}
+if (ftruncate(fd, totalBytes) != 0) {
+std::cerr<<"ftruncate failed\n";
+close(fd);
+return 1;
+}
+close(fd);
+
+// --- 5) reset global cursor & build per-thread p1 lists (round-robin) ---
+g_writeCursor = 0;
+std::vector<std::vector<uint16_t>> threadP1(numThreads);
+for (size_t i=0; i<meta.size(); ++i)
+threadP1[i % numThreads].push_back(meta[i].first);
+
+// --- 6) launch write threads ---
+std::vector<std::thread> threads;
+threads.reserve(numThreads);
+for (int t = 0; t < numThreads; ++t) {
+threads.emplace_back(p1WriteWorker, t,
+  std::cref(threadP1[t]),
+  std::cref(finalBinPath),
+  k, nIDs,
+  std::cref(outName));
+}
+for (auto &th : threads) th.join();
+
+std::cout<<"Created single-file text output of size "
+<<totalBytes<<" bytes.\n";
+return 0;
+}
+
+
+
 
 // We remove the old "writeKmerCount" approach that merged (kmer+count) into 128 bits.
 // Instead, we store them separately as a struct with 128-bit kmer + 32-bit count.
@@ -1158,209 +1049,19 @@ struct KmerCountRecord {
 
 static std::vector<std::vector<std::ofstream>> g_outBin;
 
-static void phase1Worker(int threadID, ThreadRange range, const std::string &finalBin)
-{
-    FinalBinReader reader(finalBin,g_k,range.p1Start, range.p1End);
-    if(!reader.good()) return;
+// ------------------------------------------------------------------------
+// New globals for per-genome multi-file output
+static std::array<std::mutex, MAX_GENOME_IDS>             g_fileMutexes;
+static std::array<std::atomic<size_t>, MAX_GENOME_IDS>    g_fileSizesAtomic;
+static std::array<std::atomic<size_t>, MAX_GENOME_IDS>    g_fileOffsets;
 
-    bool haveCurr=false;
-    uint128_t currKmer=0;
-    std::vector<uint32_t> counts(g_nIDs,0);
+static std::array<int, MAX_GENOME_IDS> g_outFds;
 
-    auto flushCurr=[&](uint128_t km){
-        for(uint8_t gid=0; gid<g_nIDs; gid++){
-            uint32_t c=counts[gid];
-            if(c>0){
-                KmerCountRecord rec;
-                rec.kmerLo = (uint64_t)(km & 0xFFFFFFFFFFFFFFFFULL);
-                rec.kmerHi = (uint64_t)(km >> 64);
-                rec.count  = c;
-                g_outBin[threadID][gid].write((const char*)&rec, sizeof(rec));
-            }
-        }
-    };
 
-    while(true){
-        NextRecord nr=reader.getNext();
-        if(!nr.valid){
-            if(haveCurr) flushCurr(currKmer);
-            break;
-        }
-        if(!haveCurr){
-            haveCurr=true;
-            currKmer=nr.kmer;
-            std::fill(counts.begin(),counts.end(),0);
-            counts[nr.genomeID]+=nr.count;
-        } else {
-            if(nr.kmer==currKmer){
-                counts[nr.genomeID]+=nr.count;
-            } else {
-                flushCurr(currKmer);
-                currKmer=nr.kmer;
-                std::fill(counts.begin(),counts.end(),0);
-                counts[nr.genomeID]+=nr.count;
-            }
-        }
-    }
-}
 
-static void phase2Worker(int threadID, int numThreads)
-{
-    for(int gid=threadID; gid<g_nIDs; gid+=numThreads){
-        std::string txtName="genome_"+g_genomeNames[gid]+".txt";
-        std::ofstream ofs(txtName);
-        if(!ofs) {
-            continue;
-        }
-        for(int t=0;t<g_numThreads;t++){
-            std::string binName="genome_"+std::to_string(gid)
-                               +"_worker_"+std::to_string(t)+".bin";
-            if(!std::filesystem::exists(binName)) continue;
-            std::ifstream ifb(binName,std::ios::binary);
-            if(!ifb) continue;
 
-            while(true){
-                KmerCountRecord rec;
-                if(!ifb.read((char*)&rec,sizeof(rec))) break;
-                uint128_t kmer = ((uint128_t)rec.kmerHi << 64) | rec.kmerLo;
-                KmerResult r=decodeKmer128(kmer,g_k);
-                ofs<<r.kmer<<" "<<rec.count<<"\n";
-            }
-            std::error_code ec;
-            std::filesystem::remove(binName,ec);
-        }
-    }
-}
 
-int doMultipleFilesOutput(const std::string &finalBinPath, int numThreads)
-{
-    using clock=std::chrono::high_resolution_clock;
-    auto t0=clock::now();
-    g_numThreads=numThreads;
-    if(g_numThreads<1) g_numThreads=1;
 
-    {
-        std::ifstream ifs(finalBinPath, std::ios::binary);
-        if(!ifs){
-            std::cerr<<"Cannot open "<<finalBinPath<<"\n";
-            return 1;
-        }
-        {
-            char mg[4];
-            if(!ifs.read(mg,4)){
-                return 1;
-            }
-            if(std::strncmp(mg,"BINF",4)!=0){
-                return 1;
-            }
-        }
-        if(!ifs.read((char*)&g_k,sizeof(g_k))){
-            return 1;
-        }
-        if(!ifs.read((char*)&g_nIDs,sizeof(g_nIDs))){
-            return 1;
-        }
-        g_genomeNames.resize(g_nIDs);
-        for(uint8_t i=0;i<g_nIDs;i++){
-            uint16_t len;
-            if(!ifs.read((char*)&len,sizeof(len))){
-                return 1;
-            }
-            g_genomeNames[i].resize(len);
-            if(!ifs.read((char*)g_genomeNames[i].data(), len)){
-                return 1;
-            }
-        }
-        {
-            char endg[4];
-            if(!ifs.read(endg,4)){
-                return 1;
-            }
-            if(std::strncmp(endg,"ENDG",4)!=0){
-                return 1;
-            }
-        }
-    }
-    auto t00=clock::now();
-
-    g_outBin.resize(g_numThreads);
-    for(int t=0;t<g_numThreads;t++){
-        g_outBin[t].resize(g_nIDs);
-        for(uint8_t gid=0;gid<g_nIDs;gid++){
-            std::string fname="genome_"+std::to_string(gid)
-                             +"_worker_"+std::to_string(t)+".bin";
-            g_outBin[t][gid].open(fname,std::ios::binary);
-            if(!g_outBin[t][gid]){
-                std::cerr<<"Error creating "<<fname<<"\n";
-                return 1;
-            }
-        }
-    }
-    auto t000=clock::now();
-
-    int totalP1=(1<<P1_BITS);
-    int chunkSize=(totalP1+g_numThreads-1)/g_numThreads;
-    std::vector<ThreadRange> thrRanges(g_numThreads);
-    for(int i=0;i<g_numThreads;i++){
-        uint16_t start=(uint16_t)(i*chunkSize);
-        uint16_t end=(uint16_t)std::min<int>((i+1)*chunkSize-1,totalP1-1);
-        thrRanges[i]={start,end};
-    }
-
-    auto tPhase1Start=clock::now();
-    {
-        std::vector<std::thread> threads;
-        threads.reserve(g_numThreads);
-        for(int t=0;t<g_numThreads;t++){
-            threads.emplace_back(phase1Worker,t,thrRanges[t],finalBinPath);
-        }
-        for(auto &th:threads){
-            th.join();
-        }
-    }
-    auto tPhase1End=clock::now();
-    {
-        for(int t=0;t<g_numThreads;t++){
-            for(uint8_t gid=0;gid<g_nIDs;gid++){
-                g_outBin[t][gid].flush();
-            }
-        }
-    }
-    auto tx=clock::now();
-
-    auto tPhase2Start=clock::now();
-    {
-        std::vector<std::thread> threads;
-        threads.reserve(g_numThreads);
-        for(int t=0;t<g_numThreads;t++){
-            threads.emplace_back(phase2Worker,t,g_numThreads);
-        }
-        for(auto &th:threads){
-            th.join();
-        }
-    }
-    auto tPhase2End=clock::now();
-
-    auto tCleanupStart=clock::now();
-    // (any additional cleanup if needed)
-    auto tCleanupEnd=clock::now();
-
-    auto phase1sec=std::chrono::duration<double>(tPhase1End-tPhase1Start).count();
-    auto phase2sec=std::chrono::duration<double>(tPhase2End-tPhase2Start).count();
-    auto cleansec=std::chrono::duration<double>(tCleanupEnd-tCleanupStart).count();
-    auto totalSec=std::chrono::duration<double>(tCleanupEnd-t0).count();
-    auto debug2=std::chrono::duration<double>(t000-t00).count();
-    auto debug=std::chrono::duration<double>(tx-tPhase1End).count();
-
-    std::cout<<"Phase 1 took: "<<phase1sec<<" seconds\n";
-    std::cout<<"Phase 2 took: "<<phase2sec<<" seconds\n";
-    std::cout<<"Cleanup took: "<<cleansec<<" seconds\n";
-    std::cout<<"Total took: "<<totalSec<<" seconds\n";
-    std::cout<<"Debug: "<<debug<<" seconds\n";
-    std::cout<<"Debug2: "<<debug2<<" seconds\n";
-    std::cout<<"Done. Created per-genome .txt outputs.\n";
-    return 0;
-}
 
 // Print updated usage
 void printUsage() {
@@ -1369,7 +1070,7 @@ void printUsage() {
         "  ./maf_counter_dump [options] <final.bin>\n\n"
         "Options:\n"
         "  --output_mode=<single|multiple>\n"
-        "        Output mode: single = single-file output using mmap (default),\n"
+        "        Output mode: single = single-file  (default),\n"
         "                     multiple = per-genome output.\n"
         "  --threads <VAL>           Number of threads to use (default: 1).\n"
         "  --output_file <filename>  Output file name for single-file mode (default: final_sorted_<k>_dump.txt).\n"
@@ -1379,9 +1080,330 @@ void printUsage() {
         "  <final.bin>              Input binary file generated by maf_counter_count.\n";
 }
 
+int doMultipleFilesOutput(const std::string &finalBinPath,
+    int numThreads,
+    const std::string &outputDirectory)
+{
+// --- 1) parse header (same as before) ---
+std::ifstream ifs(finalBinPath, std::ios::binary);
+if (!ifs) {
+std::cerr << "Cannot open " << finalBinPath << "\n";
+return 1;
+}
+char mg[4];
+if (!ifs.read(mg,4) || std::strncmp(mg,"BINF",4)!=0) {
+std::cerr<<"Bad magic in "<<finalBinPath<<"\n";
+return 1;
+}
+if (!ifs.read((char*)&g_k,sizeof(g_k))) return 1;
+if (!ifs.read((char*)&g_nIDs,sizeof(g_nIDs))) return 1;
+g_genomeNames.resize(g_nIDs);
+for(uint8_t i=0;i<g_nIDs;i++){
+uint16_t len;
+if(!ifs.read((char*)&len,sizeof(len))) return 1;
+g_genomeNames[i].resize(len);
+if(!ifs.read(g_genomeNames[i].data(), len)) return 1;
+}
+char endg[4];
+if(!ifs.read(endg,4) || std::strncmp(endg,"ENDG",4)!=0){
+std::cerr<<"Missing ENDG sentinel\n"; return 1;
+}
+
+// --- 2) read & sort metadata & distribute P1s ---
+auto meta = readP1Metadata("final.metadata");
+if (meta.empty()) {
+std::cerr << "No metadata entries found\n";
+return 1;
+}
+// round-robin P1 → threads
+std::vector<std::vector<uint16_t>> thrRanges(numThreads);
+for (size_t i = 0; i < meta.size(); ++i) {
+thrRanges[i % numThreads].push_back(meta[i].first);
+}
+
+for (uint8_t gid = 0; gid < g_nIDs; ++gid) {
+    g_fileSizesAtomic[gid].store(0, std::memory_order_relaxed);
+    g_fileOffsets  [gid].store(0, std::memory_order_relaxed);
+}
+
+
+auto estimateWorker = [&](const std::vector<uint16_t> &p1List){
+for (uint16_t p1 : p1List) {
+FinalBinReader reader(finalBinPath, g_k, p1, p1);
+if (!reader.good()) continue;
+bool have = false;
+uint128_t curr=0;
+std::vector<uint32_t> counts(g_nIDs,0);
+auto flushCounts = [&](){
+// compute bytes for each genomeID with count>0
+size_t base = g_k + 1; // kmer + " "
+for (uint8_t gid=0; gid<g_nIDs; ++gid) {
+    uint32_t c = counts[gid];
+    if (!c) continue;
+    // line is: "<kmer> <count>\n"
+    size_t sz = base
+              + digitCount(c)
+              + 1; // '\n'
+    g_fileSizesAtomic[gid].fetch_add(sz,
+      std::memory_order_relaxed);
+}
+
+};
+while (true) {
+NextRecord nr = reader.getNext();
+if (!nr.valid) {
+if (have) flushCounts();
+break;
+}
+if (!have) {
+have = true;
+curr = nr.kmer;
+std::fill(counts.begin(), counts.end(), 0);
+}
+if (nr.kmer == curr) {
+counts[nr.genomeID] += nr.count;
+} else {
+flushCounts();
+curr = nr.kmer;
+std::fill(counts.begin(), counts.end(), 0);
+counts[nr.genomeID] += nr.count;
+}
+}
+}
+};
+
+// launch estimation threads
+std::vector<std::thread> estThreads;
+for (int t = 0; t < numThreads; ++t) {
+estThreads.emplace_back(estimateWorker, std::cref(thrRanges[t]));
+}
+for (auto &th : estThreads) th.join();
+
+// --- 4) TRUNCATE each genome file to its exact size ---
+
+for (uint8_t gid = 0; gid < g_nIDs; ++gid) {
+    std::string fn = outputDirectory + "/genome_" + g_genomeNames[gid] + ".txt";
+    int fd = open(fn.c_str(), O_RDWR|O_CREAT, 0666);
+    if (fd < 0) { /* error */ }
+    size_t needed = g_fileSizesAtomic[gid].load();
+    if (ftruncate(fd, needed) != 0) { /* error */ }
+    g_outFds[gid] = fd;
+}
+
+
+// --- 5) SECOND PASS: buffered write into each genome file ---
+const size_t BUF_THRESHOLD = 5 * 1024 * 1024;  // 20 MiB
+
+
+auto writeWorker = [&](int threadID){
+auto &plist = thrRanges[threadID];
+// per-genome in-memory buffers
+std::vector<std::string> buffers(g_nIDs);
+for (uint16_t p1 : plist) {
+FinalBinReader reader(finalBinPath, g_k, p1, p1);
+if (!reader.good()) continue;
+bool have = false;
+uint128_t curr=0;
+std::vector<uint32_t> counts(g_nIDs,0);
+auto flushLine = [&](){
+    KmerResult kr = decodeKmer128(curr, g_k);
+    for (uint8_t gid=0; gid<g_nIDs; ++gid) {
+        uint32_t c = counts[gid];
+        if (!c) continue;
+        // build "kmer count\n"
+        auto &buf = buffers[gid];
+        buf += kr.kmer;
+        buf += ' ';
+        buf += std::to_string(c);
+        buf += '\n';
+    }
+};
+;
+;
+while (true) {
+NextRecord nr = reader.getNext();
+if (!nr.valid) {
+if (have) flushLine();
+break;
+}
+if (!have) {
+have = true;
+curr = nr.kmer;
+std::fill(counts.begin(), counts.end(), 0);
+}
+if (nr.kmer == curr) {
+counts[nr.genomeID] += nr.count;
+} else {
+flushLine();
+curr = nr.kmer;
+std::fill(counts.begin(), counts.end(), 0);
+counts[nr.genomeID] += nr.count;
+}
+uint8_t gid = nr.genomeID;
+auto &b = buffers[gid];
+if (b.size() >= BUF_THRESHOLD) {
+  std::lock_guard<std::mutex> lk(g_fileMutexes[gid]);
+  size_t off = g_fileOffsets[gid].fetch_add(b.size());
+  pwrite(g_outFds[gid], b.data(), b.size(), off);
+  b.clear();
+}
+}
+}
+// final flush of any leftovers
+    for (uint8_t gid=0; gid<g_nIDs; ++gid) {
+          auto &b = buffers[gid];
+          if (b.empty()) continue;
+          std::lock_guard<std::mutex> lk(g_fileMutexes[gid]);
+          size_t off = g_fileOffsets[gid].fetch_add(b.size());
+          pwrite(g_outFds[gid], b.data(), b.size(), off);
+          b.clear();
+        }
+};
+
+// launch writer threads
+std::vector<std::thread> wThreads;
+for (int t = 0; t < numThreads; ++t) {
+wThreads.emplace_back(writeWorker, t);
+}
+for (auto &th : wThreads) th.join();
+
+
+for (uint8_t gid = 0; gid < g_nIDs; ++gid) {
+    close(g_outFds[gid]);
+}
+
+return 0;
+}
+
+int doMultipleFileSmallKmer(const std::string &finalBinPath,
+    const std::string &outputDirectory)
+{
+// 1) parse header
+std::ifstream ifs(finalBinPath, std::ios::binary);
+if (!ifs) {
+std::cerr << "Cannot open " << finalBinPath << "\n";
+return 1;
+}
+char magic[4];
+if (!ifs.read(magic,4) || std::strncmp(magic,"BINF",4)!=0) {
+std::cerr << "Bad magic in " << finalBinPath << "\n";
+return 1;
+}
+int k = 0;
+if (!ifs.read(reinterpret_cast<char*>(&k), sizeof(k))) {
+std::cerr << "Error reading k\n";
+return 1;
+}
+uint8_t nIDs = 0;
+if (!ifs.read(reinterpret_cast<char*>(&nIDs), sizeof(nIDs))) {
+std::cerr << "Error reading nIDs\n";
+return 1;
+}
+g_genomeNames.resize(nIDs);
+for (uint8_t i = 0; i < nIDs; ++i) {
+uint16_t len = 0;
+if (!ifs.read(reinterpret_cast<char*>(&len), sizeof(len))) {
+std::cerr << "Error reading genome name length\n";
+return 1;
+}
+g_genomeNames[i].resize(len);
+if (!ifs.read(g_genomeNames[i].data(), len)) {
+std::cerr << "Error reading genome name\n";
+return 1;
+}
+}
+char endg[4];
+if (!ifs.read(endg,4) || std::strncmp(endg,"ENDG",4)!=0) {
+std::cerr << "Missing ENDG sentinel\n";
+return 1;
+}
+// skip the mapSize for small‐k format
+uint64_t mapSize = 0;
+if (!ifs.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize))) {
+std::cerr << "Error reading mapSize\n";
+return 1;
+}
+
+// 2) open one output file per genome and keep them open
+std::vector<std::ofstream> ofs(nIDs);
+for (uint8_t gid = 0; gid < nIDs; ++gid) {
+std::string fn = outputDirectory + "/genome_" + g_genomeNames[gid] + ".txt";
+ofs[gid].open(fn, std::ios::binary);
+if (!ofs[gid]) {
+std::cerr << "Cannot create " << fn << "\n";
+return 1;
+}
+}
+
+// 3) per‐genome buffers of 4 MiB
+std::vector<std::string> buffers(nIDs);
+for (auto &b : buffers) b.reserve(OUT_BUF_SIZE);
+
+// 4) single‐threaded scan & write
+FinalBinReader reader(finalBinPath, k, 0, (1u << P1_BITS) - 1);
+if (!reader.good()) {
+std::cerr << "Error initializing reader\n";
+return 1;
+}
+
+bool haveCurr = false;
+uint128_t currKmer = 0;
+std::vector<uint32_t> counts(nIDs, 0);
+
+auto flushLine = [&]() {
+KmerResult kr = decodeKmer128(currKmer, k);
+for (uint8_t gid = 0; gid < nIDs; ++gid) {
+uint32_t c = counts[gid];
+if (c == 0) continue;
+auto &buf = buffers[gid];
+buf += kr.kmer;
+buf += ' ';
+buf += std::to_string(c);
+buf += '\n';
+if (buf.size() >= OUT_BUF_SIZE) {
+ofs[gid] << buf;
+buf.clear();
+}
+}
+};
+
+while (true) {
+NextRecord nr = reader.getNext();
+if (!nr.valid) {
+if (haveCurr) flushLine();
+break;
+}
+if (!haveCurr) {
+haveCurr = true;
+currKmer = nr.kmer;
+std::fill(counts.begin(), counts.end(), 0);
+}
+if (nr.kmer == currKmer) {
+counts[nr.genomeID] += nr.count;
+} else {
+flushLine();
+currKmer = nr.kmer;
+std::fill(counts.begin(), counts.end(), 0);
+counts[nr.genomeID] += nr.count;
+}
+}
+
+// 5) final flush & close
+for (uint8_t gid = 0; gid < nIDs; ++gid) {
+if (!buffers[gid].empty()) {
+ofs[gid] << buffers[gid];
+}
+ofs[gid].close();
+}
+
+std::cout << "Created per-genome small-k output in " << outputDirectory << "\n";
+return 0;
+}
+
+
 int main(int argc, char* argv[]) {
     // Default parameter values
-    std::string outputMode = "single";  // Default mode is single (mmap-based)
+    std::string outputMode = "single";  // Default mode is single 
     int numThreads = 1;
     std::string outputFile;  // For single-file mode; if empty, will be set later based on k.
     std::string outputDirectory = ".";
@@ -1428,14 +1450,40 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Call the appropriate routine based on the output mode
-    if (outputMode == "multiple") {
-        return doMultipleFilesOutput(finalBin, numThreads);
-    } else if (outputMode == "single") {
-        return doSingleFileOutputWithMmap(finalBin, outputFile, numThreads);
-    } else {
-        std::cerr << "Error: Unknown output mode '" << outputMode << "'.\n";
-        printUsage();
+    // read 'k' out of the final.bin header to detect small-k format
+    int fileK = 0;
+    std::ifstream ifs(finalBin, std::ios::binary);
+    char magic[4];
+    ifs.read(magic, 4);
+    if (std::strncmp(magic, "BINF", 4) != 0) {
+        std::cerr << "Bad magic header\n";
         return 1;
     }
+    if (!ifs.read(reinterpret_cast<char*>(&fileK), sizeof(fileK))) {
+        std::cerr << "Error reading k\n";
+        return 1;
+    }
+    
+
+    // Call the appropriate routine based on the output mode
+    if (outputMode == "multiple") {
+        if (fileK <= 10) {
+            return doMultipleFileSmallKmer(finalBin, outputDirectory);
+        } else {
+            // existing threaded version for k > 10
+            return doMultipleFilesOutput(finalBin, numThreads, outputDirectory);
+        }
+        
+        }   else if (outputMode == "single") {
+                    // if k <= 10, use buffered single-threaded dump
+                    if (fileK <= 10) {
+                        std::string outName = outputFile.empty()
+                            ? "final_sorted_" + std::to_string(fileK) + "_dump.txt"
+                            : outputFile;
+                        return doSingleFileSmallKmer(finalBin, outName);
+                    }
+                   
+                    return doSingleFileOutputWithMmap(finalBin, outputFile, numThreads); //large Ks
+                }
 }
+

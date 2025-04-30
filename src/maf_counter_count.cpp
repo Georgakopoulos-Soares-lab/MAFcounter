@@ -16,17 +16,22 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <regex>
+
+// google dense hash
 #include <google/dense_hash_map>
 #include <unordered_set>
 #include <limits>
 #include <zlib.h>
-#include <fcntl.h>      // for open
-#include <sys/mman.h>   // for mmap, munmap
+#include <sys/mman.h>
+#include <fcntl.h>      // for open, O_*
+#include <sys/sendfile.h> // for sendfile()
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // ----  NEW: Boost Multiprecision for 128-bit support  ----
 #include <boost/multiprecision/cpp_int.hpp>
-
 // --------------------------------------------------------
 namespace bmp = boost::multiprecision;
 using uint128_t = bmp::uint128_t;
@@ -41,6 +46,14 @@ static const int   P1_BITS            = 10;
 static const int   P2_BITS            = 10;
 static const size_t BIN_CAPACITY      = 1ULL << 14;
 static const size_t PACKAGE_THRESHOLD = 500000000;
+
+static const std::unordered_set<uint16_t> outlierBins = {
+    1023,0,3,255,1020,831,12,768,128,1015,15,1011,192,63,1008,1022,
+    1021,512,960,975,48,32,8,991,256,895,2,511,14,319,1019,959,
+    4,64,1012,896,252,771,207,51,136,887,338,819,204,1,767,490,
+    983,60,160,783
+};
+static std::mutex outlierMutex;
 
 // Expanded maximum k-mer length to 64
 static const int   KMER_MAX_LENGTH  = 64;  
@@ -67,6 +80,12 @@ static bool g_useCanonical = false;
 // New global variables for directories
 static std::string g_tempFilesDir = ".";   // Where intermediate bin files are stored
 static std::string g_outputDirectory = "."; // Where final.bin and final.metadata are written
+
+struct TimeStats {
+    double readTime{};
+    double sortTime{};
+    double writeTime{};
+};
 
 // Convert a single-character quality into an integer.
 static int parseQVal(char c)
@@ -212,7 +231,8 @@ static std::string removeDashes(const std::string &seq)
     return result;
 }
 
-// ---------------------- NEW: decodeKmer for 128 bits ----------------------
+// ---- decodeKmer for 128 bits ----
+#include <boost/multiprecision/cpp_int.hpp> // repeated but for clarity
 static std::string decodeKmer(uint128_t kmerVal, int K)
 {
     std::string result(K, 'N');
@@ -229,7 +249,7 @@ static std::string decodeKmer(uint128_t kmerVal, int K)
     return result;
 }
 
-// ---------------------- NEW: Reverse complement logic (128-bit) ----------------------
+// ---- Reverse complement logic (128-bit) ----
 static uint128_t reverseComplement128(uint128_t kmer, int k)
 {
     uint128_t rc = 0;
@@ -264,6 +284,8 @@ struct SmallKReaderArgs {
     std::atomic<uint64_t>* totalKmers;
     int readerId;
 };
+
+static int parseQVal(char c);  // (already defined above)
 
 static void smallKReaderFunc(SmallKReaderArgs args)
 {
@@ -332,6 +354,8 @@ static void smallKReaderFunc(SmallKReaderArgs args)
                     for (int i = 0; i < 4; i++) qiss >> qtoken;
                     qiss >> qseq;
                     cleanedQ = removeDashes(qseq);
+                    std::transform(cleanedQ.begin(), cleanedQ.end(), cleanedQ.begin(),
+               [](char c){ return std::toupper(c); });
                 } else {
                     mafFile.seekg(savePos);
                 }
@@ -339,6 +363,8 @@ static void smallKReaderFunc(SmallKReaderArgs args)
         }
 
         std::string cleaned = removeDashes(seq);
+        std::transform(cleaned.begin(), cleaned.end(), cleaned.begin(),
+               [](char c){ return std::toupper(c); });
         
         if (cleaned.size() < (size_t)args.k) continue;
 
@@ -349,10 +375,10 @@ static void smallKReaderFunc(SmallKReaderArgs args)
                 char c = cleaned[pos + i];
                 uint32_t val;
                 switch (c) {
-                    case 'A': val = 0; break;
-                    case 'C': val = 1; break;
-                    case 'G': val = 2; break;
-                    case 'T': val = 3; break;
+                    case 'A': case 'a': val = 0; break;
+                    case 'C': case 'c': val = 1; break;
+                    case 'G': case 'g': val = 2; break;
+                    case 'T': case 't': val = 3; break;
                     default:  valid = false; break;
                 }
                 if (!valid) break;
@@ -402,14 +428,13 @@ static void smallKReaderFunc(SmallKReaderArgs args)
 }
 
 // ---------------------------------------------
-// K > 10 aggregator approach (128-bit kmers, extended to handle up to 70)
+// K > 10 aggregator approach (128-bit kmers)
 // ---------------------------------------------
 struct KmerRecord {
     uint128_t kmer;
     uint8_t   genomeID;
 };
 
-// For remainder bits extraction
 static inline uint16_t extractP1(const uint128_t &kmer, int k)
 {
     int totalBits = 2*k;
@@ -434,13 +459,10 @@ struct BinBuffer {
 
 struct SuffixGroup {
     uint16_t p2_val;
-    // 0 => up to 32 bits suffix
-    // 1 => up to 64 bits suffix
-    // 3 => up to 120 bits suffix + 8 bits genome ID (total 128)
     uint8_t suffixMode;
-    std::vector<uint32_t> mode0;    // remainder<<8 | genomeID
-    std::vector<uint64_t> mode1;    // remainder<<8 | genomeID
-    std::vector<uint128_t> mode3;   // remainder<<8 | genomeID
+    std::vector<uint32_t> mode0;
+    std::vector<uint64_t> mode1;
+    std::vector<uint128_t> mode3;
 };
 
 struct BinChunk {
@@ -448,91 +470,48 @@ struct BinChunk {
     std::vector<SuffixGroup> groups;
 };
 
-static void LSDRadixSort32(std::vector<uint32_t> &arr)
-{
-    const int PASSES = 4;
-    const int RADIX = 256;
-    std::vector<uint32_t> tmp(arr.size());
-    for (int pass = 0; pass < PASSES; pass++){
-        int shift = pass * 8;
-        uint32_t count[RADIX];
-        std::memset(count, 0, sizeof(count));
-        for (auto v : arr) {
-            uint8_t b = (uint8_t)((v >> shift) & 0xFF);
-            count[b]++;
-        }
-        uint32_t pos[RADIX];
+// LSD-based sorts for 32,64,128
+static inline void LSD32(std::vector<uint32_t>& a) {
+    if (a.empty()) return;
+    constexpr int P=4, R=256;
+    std::vector<uint32_t> tmp(a.size());
+    for (int p=0; p<P; ++p) {
+        uint32_t cnt[R] = {0}, pos[R];
+        for (auto v : a) ++cnt[(v >> (p*8)) & 0xFF];
         pos[0] = 0;
-        for (int i = 1; i < RADIX; i++) {
-            pos[i] = pos[i - 1] + count[i - 1];
-        }
-        for (auto v : arr) {
-            uint8_t b = (uint8_t)((v >> shift) & 0xFF);
-            tmp[pos[b]++] = v;
-        }
-        arr.swap(tmp);
+        for (int i=1; i<R; ++i) pos[i] = pos[i-1] + cnt[i-1];
+        for (auto v : a) tmp[pos[(v >> (p*8)) & 0xFF]++] = v;
+        a.swap(tmp);
+    }
+}
+static inline void LSD64(std::vector<uint64_t>& a) {
+    if (a.empty()) return;
+    constexpr int P=8, R=256;
+    std::vector<uint64_t> tmp(a.size());
+    for (int p=0; p<P; ++p) {
+        uint64_t cnt[R] = {0}, pos[R];
+        for (auto v : a) ++cnt[(v >> (p*8)) & 0xFF];
+        pos[0] = 0;
+        for (int i=1; i<R; ++i) pos[i] = pos[i-1] + cnt[i-1];
+        for (auto v : a) tmp[pos[(v >> (p*8)) & 0xFF]++] = v;
+        a.swap(tmp);
+    }
+}
+static inline void LSD128(std::vector<uint128_t>& a) {
+    if (a.empty()) return;
+    constexpr int P=16, R=256;
+    std::vector<uint128_t> tmp(a.size());
+    for (int p=0; p<P; ++p) {
+        uint64_t cnt[R] = {0}, pos[R];
+        for (auto &v : a) ++cnt[static_cast<uint8_t>((v >> (p*8)) & 0xFF)];
+        pos[0] = 0;
+        for (int i=1; i<R; ++i) pos[i] = pos[i-1] + cnt[i-1];
+        for (auto &v : a)
+            tmp[pos[static_cast<uint8_t>((v >> (p*8)) & 0xFF)]++] = v;
+        a.swap(tmp);
     }
 }
 
-static void LSDRadixSort64(std::vector<uint64_t> &arr)
-{
-    const int PASSES = 8;
-    const int RADIX = 256;
-    std::vector<uint64_t> tmp(arr.size());
-    for (int pass = 0; pass < PASSES; pass++){
-        int shift = pass * 8;
-        uint64_t count[RADIX];
-        std::memset(count, 0, sizeof(count));
-        for (auto v : arr) {
-            uint8_t b = (uint8_t)((v >> shift) & 0xFF);
-            count[b]++;
-        }
-        uint64_t pos[RADIX];
-        pos[0] = 0;
-        for (int i = 1; i < RADIX; i++) {
-            pos[i] = pos[i - 1] + count[i - 1];
-        }
-        for (auto v : arr) {
-            uint8_t b = (uint8_t)((v >> shift) & 0xFF);
-            tmp[pos[b]++] = v;
-        }
-        arr.swap(tmp);
-    }
-}
-
-// NEW: LSDRadixSort for 128-bit values
-static void LSDRadixSort128(std::vector<uint128_t> &arr)
-{
-    const int PASSES = 16; 
-    const int RADIX = 256;
-    std::vector<uint128_t> tmp(arr.size());
-    for (int pass = 0; pass < PASSES; pass++){
-        int shift = pass * 8;
-        uint64_t count[RADIX];
-        std::memset(count, 0, sizeof(count));
-        for (auto &v : arr) {
-            // Extracting the byte:
-            uint128_t b = (v >> shift) & 0xFFU;
-            count[b.convert_to<uint64_t>()]++;
-        }
-        uint64_t pos[RADIX];
-        pos[0] = 0;
-        for (int i = 1; i < RADIX; i++) {
-            pos[i] = pos[i - 1] + count[i - 1];
-        }
-        for (auto &v : arr) {
-            uint128_t b = (v >> shift) & 0xFFU;
-            uint64_t idx = b.convert_to<uint64_t>();
-            tmp[pos[idx]++] = v;
-        }
-        arr.swap(tmp);
-    }
-}
-
-// Decide suffix mode based on remainder bits
-//  remainder_bits <= 32 => mode 0
-//  remainder_bits <= 64 => mode 1
-//  remainder_bits <=120 => mode 3
 static uint8_t determineSuffixMode(int remainder_bits)
 {
     if (remainder_bits <= 32) return 0;
@@ -595,6 +574,9 @@ static BinChunk partialSortAndCompact(const BinBuffer &binBuf, int k)
     return chunk;
 }
 
+// -------------------------------------
+// Package Manager
+// -------------------------------------
 struct PMBinAccum {
     std::vector<SuffixGroup> groups;
     size_t totalCount = 0;
@@ -651,7 +633,6 @@ static void mergeBinChunkIntoPackage(BinChunk &chunk,
 
 static void writePackageToDisk(uint16_t p1_id, PMBinAccum &accum, int k)
 {
-    // All temp (intermediate) files now go into g_tempFilesDir
     std::uniform_int_distribution<int> dist(100000,999999);
     static thread_local std::mt19937 rng(std::random_device{}());
     int rnd = dist(rng);
@@ -678,8 +659,6 @@ static void writePackageToDisk(uint16_t p1_id, PMBinAccum &accum, int k)
     hdr.p2_bits      = P2_BITS;
     hdr.genome_id_bits = 8;
 
-    // In this aggregated file, all groups have the same suffix mode
-    // but let's just pick the first group's mode if it exists
     uint8_t anyMode = 0;
     if (!accum.groups.empty()) {
         anyMode = accum.groups.front().suffixMode;
@@ -723,7 +702,6 @@ static void writePackageToDisk(uint16_t p1_id, PMBinAccum &accum, int k)
                 }
                 break;
             case 3:
-                // Write each 128-bit value in little-endian
                 for (auto &val : g.mode3) {
                     unsigned char bytes[16];
                     for (int i = 0; i < 16; i++) {
@@ -743,6 +721,7 @@ static void writePackageToDisk(uint16_t p1_id, PMBinAccum &accum, int k)
 static void PMThreadLoop(PackageManager &pm, int k, int pmId)
 {
     auto start = std::chrono::steady_clock::now();
+    double pmWriteTime = 0.0;  // total time spent in writePackageToDisk()
     size_t BIN_THRESHOLD = (PACKAGE_THRESHOLD / (1 << P1_BITS)) * 5;
     while (true) {
         std::unique_lock<std::mutex> lock(pm.pmMutex);
@@ -755,7 +734,10 @@ static void PMThreadLoop(PackageManager &pm, int k, int pmId)
             mergeBinChunkIntoPackage(c, pm.pmData);
             auto &acc = pm.pmData[c.p1_id];
             if (acc.totalCount >= BIN_THRESHOLD) {
+                 auto w0 = std::chrono::steady_clock::now();
                 writePackageToDisk(c.p1_id, acc, k);
+               auto w1 = std::chrono::steady_clock::now();
+                pmWriteTime += std::chrono::duration<double>(w1 - w0).count();
             }
             lock.lock();
         }
@@ -763,15 +745,20 @@ static void PMThreadLoop(PackageManager &pm, int k, int pmId)
     }
     for (auto &kv : pm.pmData) {
         if (kv.second.totalCount > 0) {
+             auto w0 = std::chrono::steady_clock::now();
             writePackageToDisk(kv.first, kv.second, k);
+            auto w1 = std::chrono::steady_clock::now();
+           pmWriteTime += std::chrono::duration<double>(w1 - w0).count();
         }
     }
-    auto end = std::chrono::steady_clock::now();
-    double duration = std::chrono::duration<double>(end - start).count();
-    {
-        std::lock_guard<std::mutex> lock(coutMutex);
-        std::cout << "PM thread " << pmId << " finished in " << duration << " seconds.\n";
-    }
+        auto end = std::chrono::steady_clock::now();
+        double totalDuration = std::chrono::duration<double>(end - start).count();
+        {
+            std::lock_guard<std::mutex> lock(coutMutex);
+            std::cout << "PM thread " << pmId
+                      << " total run time: " << totalDuration << " s, "
+                      << "time in writePackageToDisk(): " << pmWriteTime << " s\n";
+        }
 }
 
 // -------------------------------------
@@ -800,111 +787,141 @@ static void readerFunc(ReaderArgs args)
     uint64_t localCount = 0;
 
     std::vector<BinBuffer> localBins(1 << P1_BITS);
-    for (size_t i = 0; i < localBins.size(); i++) {
-        localBins[i].p1_id = (uint16_t)i;
-    }
+    for (size_t i = 0; i < localBins.size(); ++i)
+        localBins[i].p1_id = static_cast<uint16_t>(i);
+
+    /*  mask keeps only the low 2*k bits after we shift‑in a new base        *
+     *  (If k == 64 the whole 128‑bit word is used, so we just take ~0ULL).  */
+    const uint128_t MASK = (args.k == 64)
+        ? std::numeric_limits<uint128_t>::max()
+        : (((uint128_t)1 << (2 * args.k)) - 1);
 
     std::string line;
-    while (true) {
+    while (true)
+    {
         if (mafFile.tellg() >= args.endPos) break;
-        if (!std::getline(mafFile, line)) break;
-        if (line.empty()) continue;
+        if (!std::getline(mafFile, line))   break;
+        if (line.empty())                   continue;
 
-        if (line[0] == 'a') {
+        // Block‑header line ― record its score.
+        if (line[0] == 'a')
+        {
             std::size_t pos = line.find("score=");
-            if (pos != std::string::npos) {
-                std::string scoreStr = line.substr(pos + 6);
-                try {
-                    currentBlockScore = std::stod(scoreStr);
-                } catch (...) {
-                    currentBlockScore = 0.0;
-                }
-            } else {
+            if (pos != std::string::npos)
+                try { currentBlockScore = std::stod(line.substr(pos + 6)); }
+                catch (...) { currentBlockScore = 0.0; }
+            else
                 currentBlockScore = 0.0;
-            }
             continue;
         }
 
-        if (line[0] != 's') {
+        if (line[0] != 's') continue;               // we only want "s" lines
+        if (currentBlockScore < g_minAScore ||
+            currentBlockScore > g_maxAScore)        // A‑score filter
             continue;
-        }
 
-        if (currentBlockScore < g_minAScore || currentBlockScore > g_maxAScore) {
-            continue;
-        }
-
+        // -------- parse the "s" line --------
         std::istringstream iss(line);
         std::string token, src, seq;
         iss >> token >> src;
-        for(int i = 0; i < 4; i++) iss >> token;
-        iss >> seq;
+        for (int i = 0; i < 4; ++i) iss >> token;   // start, size, strand, srcSize
+        iss >> seq;                                 // aligned sequence (with dashes)
 
+        // Genome name → numeric id
         size_t dotPos = src.find('.');
-        std::string gname = (dotPos == std::string::npos) ? src : src.substr(0, dotPos);
-        if (g_useGenomeIdFilter && g_includedGenomeNames.find(gname) == g_includedGenomeNames.end()) {
+        std::string gname = (dotPos == std::string::npos)
+                            ? src
+                            : src.substr(0, dotPos);
+        if (g_useGenomeIdFilter &&
+            g_includedGenomeNames.find(gname) == g_includedGenomeNames.end())
             continue;
-        }
         uint8_t gID = getGenomeID(gname);
 
+        // Optional quality line
         std::string cleanedQ;
-        if ((g_minQVal >= 0 || g_maxQVal >= 0)) {
+        if ((g_minQVal >= 0 || g_maxQVal >= 0))
+        {
             std::streampos savePos = mafFile.tellg();
-            std::string possibleQ;
-            if (std::getline(mafFile, possibleQ)) {
-                if (!possibleQ.empty() && possibleQ[0] == 'q') {
-                    std::istringstream qiss(possibleQ);
+            std::string qline;
+            if (std::getline(mafFile, qline))
+            {
+                if (!qline.empty() && qline[0] == 'q')
+                {
+                    std::istringstream qiss(qline);
                     std::string qtoken, qsrc, qseq;
                     qiss >> qtoken >> qsrc;
-                    for (int i = 0; i < 4; i++) qiss >> qtoken;
+                    for (int i = 0; i < 4; ++i) qiss >> qtoken;
                     qiss >> qseq;
-                    cleanedQ = removeDashes(qseq);
-                } else {
+                    cleanedQ = removeDashes(qseq);      // still using existing helper
+                    std::transform(cleanedQ.begin(), cleanedQ.end(), cleanedQ.begin(),
+               [](char c){ return std::toupper(c); });
+                }
+                else
+                {
                     mafFile.seekg(savePos);
                 }
             }
         }
 
+        // Remove gaps from the sequence  (unchanged helper)
         std::string cleaned = removeDashes(seq);
-        args.totalLengthProcessed += cleaned.length();
+        std::transform(cleaned.begin(), cleaned.end(), cleaned.begin(),
+        [](char c){ return std::toupper(c); });
+        args.totalLengthProcessed    += cleaned.length();
         args.totalSequencesProcessed += 1;
-        if (cleaned.size() < (size_t)args.k) continue;
 
-        for (size_t pos = 0; pos + args.k <= cleaned.size(); pos++) {
-            uint128_t kmerBits = 0U;
-            bool valid = true;
-            for (int i = 0; i < args.k; i++) {
-                char c = cleaned[pos + i];
-                uint128_t val;
-                switch (c) {
-                    case 'A': val = 0U; break;
-                    case 'C': val = 1U; break;
-                    case 'G': val = 2U; break;
-                    case 'T': val = 3U; break;
-                    default:  valid = false; break;
-                }
-                if (!valid) break;
-                if (!cleanedQ.empty()) {
-                    if (!isQValid(cleanedQ[pos + i])) {
-                        valid = false;
-                        break;
-                    }
-                }
-                kmerBits = (kmerBits << 2) | val;
-            }
-            if (!valid) continue;
+        if (cleaned.size() < static_cast<size_t>(args.k)) continue;
 
-            if (g_useCanonical) {
-                kmerBits = canonicalKmer128(kmerBits, args.k);
+        /* -----------------------------------------------------------------
+         *  ROLLING  K‑MER  LOOP
+         * ----------------------------------------------------------------*/
+        uint128_t kmerBits = 0;      // accumulates the forward strand
+        int       validLen = 0;      // # of consecutive valid (non‑N, pass‑Q) bases
+
+        for (size_t i = 0; i < cleaned.size(); ++i)
+        {
+            char c = cleaned[i];
+            uint8_t val;
+            switch (c)               // convert DNA to 2 bits
+            {
+                case 'A': case 'a': val = 0; break;
+                case 'C': case 'c': val = 1; break;
+                case 'G': case 'g': val = 2; break;
+                case 'T': case 't': val = 3; break;
+                default:            // any non‑ACGT breaks the window
+                    validLen = 0;
+                    kmerBits = 0;
+                    continue;
             }
 
-            uint16_t p1 = extractP1(kmerBits, args.k);
-            localBins[p1].records.push_back({kmerBits, gID});
-            localCount++;
+            // Quality check (if requested)
+            if (!cleanedQ.empty() && !isQValid(cleanedQ[i]))
+            {
+                validLen = 0;
+                kmerBits = 0;
+                continue;
+            }
 
-            if (localBins[p1].records.size() >= BIN_CAPACITY) {
+            /* shift the previous k‑mer left by 2 bits and add the
+             * new base; then mask to keep at most 2*k bits           */
+            kmerBits = ((kmerBits << 2) | val) & MASK;
+
+            if (++validLen < args.k) continue;       // not enough bases yet
+
+            uint128_t kmerOut = kmerBits;
+            if (g_useCanonical)
+                kmerOut = canonicalKmer128(kmerOut, args.k);   // unchanged helper
+
+            uint16_t p1 = extractP1(kmerOut, args.k);
+            auto &vec   = localBins[p1].records;
+            vec.push_back({kmerOut, gID});
+            ++localCount;
+
+            if (vec.size() >= BIN_CAPACITY)          // flush full bin
+            {
                 BinChunk chunk = partialSortAndCompact(localBins[p1], args.k);
-                localBins[p1].records.clear();
-                int pmIndex = (int)(chunk.p1_id % args.numPMs);
+                vec.clear();
+                int pmIndex = static_cast<int>(chunk.p1_id % args.numPMs);
                 auto &pm = (*args.pms)[pmIndex];
                 {
                     std::lock_guard<std::mutex> lk(pm.pmMutex);
@@ -914,11 +931,14 @@ static void readerFunc(ReaderArgs args)
             }
         }
     }
-    for (auto &b : localBins) {
-        if (!b.records.empty()) {
+
+    /* flush any leftover records in the per‑thread bins */
+    for (auto &b : localBins)
+        if (!b.records.empty())
+        {
             BinChunk chunk = partialSortAndCompact(b, args.k);
             b.records.clear();
-            int pmIndex = (int)(chunk.p1_id % args.numPMs);
+            int pmIndex = static_cast<int>(chunk.p1_id % args.numPMs);
             auto &pm = (*args.pms)[pmIndex];
             {
                 std::lock_guard<std::mutex> lk(pm.pmMutex);
@@ -926,246 +946,49 @@ static void readerFunc(ReaderArgs args)
                 pm.pmCV.notify_one();
             }
         }
-    }
+
     args.totalKmers->fetch_add(localCount, std::memory_order_relaxed);
 
     auto end = std::chrono::steady_clock::now();
     double duration = std::chrono::duration<double>(end - start).count();
     {
         std::lock_guard<std::mutex> lock(coutMutex);
-        std::cout << "Reader thread " << args.readerId << " finished in " << duration << " seconds.\n";
+        std::cout << "Reader thread " << args.readerId
+                  << " finished in " << duration << " seconds.\n";
     }
 
-    if (args.totalSequencesProcessed > 0) {
-        std::cout << "Avg sequence size processed: " 
-                  << args.totalLengthProcessed / args.totalSequencesProcessed << "\n";
+    if (args.totalSequencesProcessed > 0)
+    {
+        std::cout << "Avg sequence size processed: "
+                  << args.totalLengthProcessed / args.totalSequencesProcessed
+                  << "\n";
     }
 }
 
 // ---------------------------------------------
 // Merge multiple bin_X_*.bin => bin_X_complete => final.bin
 // ---------------------------------------------
-struct CombinedData {
-    uint8_t suffixMode;
-    std::vector<uint32_t> v0;
-    std::vector<uint64_t> v1;
-    std::vector<uint128_t> v3;
+struct FileHeader {
+    char     magic[4];
+    uint32_t k;
+    uint16_t p1_bits, p2_bits;
+    uint8_t  genome_id_bits, suffix_mode, reserved[2];
 };
 
-struct GroupMeta {
-    uint16_t p2_val;
-    uint32_t sz;
+struct GroupMeta { uint16_t p2_val; uint32_t sz; };
+
+/* Combined container */
+struct Comb {
+    uint8_t mode{};
+    std::unordered_map<uint16_t,std::vector<uint32_t>> v0;
+    std::unordered_map<uint16_t,std::vector<uint64_t>> v1;
+    std::unordered_map<uint16_t,std::vector<uint128_t>> v3;
 };
 
-static void processBinFiles(uint16_t p1, const std::vector<std::string> &files, const std::string &outName)
-{
-    bool firstFile = true;
-    bool modeError = false;
-    uint32_t file_k = 0;
-    uint16_t file_p1_bits = 0;
-    uint16_t file_p2_bits = 0;
-    uint8_t suffix_mode = 0;
 
-    std::unordered_map<uint16_t, CombinedData> combined;
-    for (auto &fname : files) {
-        std::ifstream ifs(fname, std::ios::binary);
-        if(!ifs) continue;
-
-        struct FileHeader {
-            char     magic[4];
-            uint32_t k;
-            uint16_t p1_bits;
-            uint16_t p2_bits;
-            uint8_t  genome_id_bits;
-            uint8_t  suffix_mode;
-            uint8_t  reserved[2];
-        } hdr;
-
-        ifs.read((char*)&hdr, sizeof(hdr));
-        if (std::strncmp(hdr.magic, "KMHD", 4) != 0) {
-            continue;
-        }
-
-        uint8_t fileMode = hdr.suffix_mode;
-
-        if (firstFile) {
-            file_k        = hdr.k;
-            file_p1_bits  = hdr.p1_bits;
-            file_p2_bits  = hdr.p2_bits;
-            suffix_mode   = fileMode;
-            firstFile     = false;
-        } else {
-            if (hdr.k != file_k || hdr.p1_bits != file_p1_bits ||
-                hdr.p2_bits != file_p2_bits || fileMode != suffix_mode)
-            {
-                modeError = true;
-                continue;
-            }
-        }
-
-        char sentinel[4];
-        ifs.read(sentinel, 4);
-
-        uint32_t groupCount = 0;
-        ifs.read((char*)&groupCount, sizeof(groupCount));
-
-        std::vector<GroupMeta> gmeta(groupCount);
-        for (uint32_t i = 0; i < groupCount; i++) {
-            ifs.read((char*)&gmeta[i].p2_val, sizeof(gmeta[i].p2_val));
-            ifs.read((char*)&gmeta[i].sz,     sizeof(gmeta[i].sz));
-        }
-
-        ifs.read(sentinel, 4);
-
-        for (auto &gm : gmeta) {
-            if (gm.sz == 0) continue;
-            auto &cd = combined[gm.p2_val];
-            cd.suffixMode = suffix_mode;
-            switch (suffix_mode) {
-                case 0: {
-                    size_t oldSize = cd.v0.size();
-                    cd.v0.resize(oldSize + gm.sz);
-                    ifs.read((char*)&cd.v0[oldSize], gm.sz * sizeof(uint32_t));
-                } break;
-                case 1: {
-                    size_t oldSize = cd.v1.size();
-                    cd.v1.resize(oldSize + gm.sz);
-                    for (size_t idx = 0; idx < gm.sz; idx++) {
-                        ifs.read((char*)&cd.v1[oldSize + idx], sizeof(uint64_t));
-                    }
-                } break;
-                case 3: {
-                    size_t oldSize = cd.v3.size();
-                    cd.v3.resize(oldSize + gm.sz);
-                    for (size_t idx = 0; idx < gm.sz; idx++) {
-                        unsigned char bytes[16];
-                        ifs.read((char*)bytes, 16);
-                        uint128_t val = 0;
-                        for (int b = 0; b < 16; b++) {
-                            uint128_t part = (uint128_t)bytes[b];
-                            val |= (part << (8ULL * b));
-                        }
-                        cd.v3[oldSize + idx] = val;
-                    }
-                } break;
-            }
-        }
-    }
-
-    if (modeError) {
-        return;
-    }
-
-    std::ofstream ofs(outName, std::ios::binary);
-    if(!ofs) return;
-
-    struct FileHeader {
-        char     magic[4];
-        uint32_t k;
-        uint16_t p1_bits;
-        uint16_t p2_bits;
-        uint8_t  genome_id_bits;
-        uint8_t  suffix_mode;
-        uint8_t  reserved[2];
-    } hdr;
-
-    std::memcpy(hdr.magic, "KMHD", 4);
-    hdr.k = file_k;
-    hdr.p1_bits = file_p1_bits;
-    hdr.p2_bits = file_p2_bits;
-    hdr.genome_id_bits = 8;
-    hdr.suffix_mode = suffix_mode;
-    hdr.reserved[0] = 0; 
-    hdr.reserved[1] = 0;
-    ofs.write((const char*)&hdr, sizeof(hdr));
-    const char *sent1 = "kmhd";
-    ofs.write(sent1, 4);
-
-    std::vector<uint16_t> p2vals;
-    p2vals.reserve(combined.size());
-    for (auto &kv : combined) {
-        p2vals.push_back(kv.first);
-    }
-    std::sort(p2vals.begin(), p2vals.end());
-
-    std::vector<uint32_t> groupSizes;
-    groupSizes.reserve(p2vals.size());
-    for (uint16_t v : p2vals) {
-        auto &cd = combined[v];
-        switch (cd.suffixMode) {
-            case 0: groupSizes.push_back((uint32_t)cd.v0.size()); break;
-            case 1: groupSizes.push_back((uint32_t)cd.v1.size()); break;
-            case 3: groupSizes.push_back((uint32_t)cd.v3.size()); break;
-        }
-    }
-    uint32_t groupCount = (uint32_t)p2vals.size();
-    ofs.write((const char*)&groupCount, sizeof(groupCount));
-
-    for (size_t i = 0; i < groupCount; i++) {
-        uint16_t p2v = p2vals[i];
-        ofs.write((const char*)&p2v, sizeof(p2v));
-        uint32_t sz = groupSizes[i];
-        ofs.write((const char*)&sz, sizeof(sz));
-    }
-    const char* sent2 = "kmhd";
-    ofs.write(sent2, 4);
-
-    // Now sort each group and write
-    for (uint16_t v : p2vals) {
-        auto &cd = combined[v];
-        switch (cd.suffixMode) {
-            case 0: {
-                if (!cd.v0.empty()) {
-                    LSDRadixSort32(cd.v0);
-                    ofs.write((const char*)cd.v0.data(), cd.v0.size() * sizeof(uint32_t));
-                }
-            } break;
-            case 1: {
-                if (!cd.v1.empty()) {
-                    LSDRadixSort64(cd.v1);
-                    ofs.write((const char*)cd.v1.data(), cd.v1.size() * sizeof(uint64_t));
-                }
-            } break;
-            case 3: {
-                if (!cd.v3.empty()) {
-                    LSDRadixSort128(cd.v3);
-                    for (auto &val : cd.v3) {
-                        unsigned char bytes[16];
-                        for (int b = 0; b < 16; b++) {
-                            uint64_t part = (val >> (8ULL * b)).convert_to<uint64_t>();
-                            bytes[b] = static_cast<unsigned char>(part & 0xFF);
-                        }
-                        ofs.write((char*)bytes, 16);
-                    }
-                }
-            } break;
-        }
-    }
-    ofs.close();
-}
-static void purgeIntermediateParts(const std::string &excludeFile = "")
-{
-    for (auto &entry : std::filesystem::directory_iterator(g_tempFilesDir)) {
-        if (!entry.is_regular_file())
-            continue;
-        std::string fname = entry.path().filename().string();
-        // Delete files that start with "bin_" and do not contain "complete"
-        // but only in g_tempFilesDir
-        if (fname.rfind("bin_", 0) == 0 && fname.find("complete") == std::string::npos) {
-            if (fname == excludeFile)
-                continue;
-            std::error_code ec;
-            std::filesystem::remove(entry.path(), ec);
-            if (ec) {
-                std::cerr << "Warning: could not remove " << fname << ": " << ec.message() << "\n";
-            }
-        }
-    }
-}
-
+// Remove all "bin_" files if we want total purge
 static void purgeIntermediateFiles(const std::string &excludeFile = "")
 {
-    // Purge any file in g_tempFilesDir that starts with "bin_"
     for (auto &entry : std::filesystem::directory_iterator(g_tempFilesDir)) {
         if (!entry.is_regular_file())
             continue;
@@ -1182,6 +1005,146 @@ static void purgeIntermediateFiles(const std::string &excludeFile = "")
     }
 }
 
+
+
+static std::vector<char> buildPayload(
+    uint16_t p1,
+    const std::vector<std::filesystem::path>& files,
+    int mode,
+    uint32_t &k_out,
+    double &readTime,
+    double &sortTime
+) {
+    Comb comb; comb.mode = (uint8_t)mode;
+    uint32_t k_val = 0;
+    bool first = true;
+
+    auto t0 = std::chrono::steady_clock::now();
+    // read all bin_<p1>_*.bin fragments
+    for (auto &path : files) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) continue;
+        FileHeader hdr;
+        ifs.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        if (std::memcmp(hdr.magic, "KMHD", 4) != 0 ||
+            hdr.suffix_mode != comb.mode)
+            continue;
+        if (first) { k_val = hdr.k; first = false; }
+        // skip sentinel
+        ifs.seekg(4, std::ios::cur);
+        uint32_t gc; ifs.read(reinterpret_cast<char*>(&gc), 4);
+        std::vector<GroupMeta> gmeta(gc);
+        for (auto &gm : gmeta) {
+            ifs.read(reinterpret_cast<char*>(&gm.p2_val), 2);
+            ifs.read(reinterpret_cast<char*>(&gm.sz),     4);
+        }
+        // skip sentinel
+        ifs.seekg(4, std::ios::cur);
+
+        // read each group
+        for (auto &gm : gmeta) {
+            if (!gm.sz) continue;
+            switch (mode) {
+            case 0: {
+                auto &v = comb.v0[gm.p2_val];
+                size_t old = v.size();
+                v.resize(old + gm.sz);
+                ifs.read(reinterpret_cast<char*>(v.data()+old),
+                         gm.sz * sizeof(uint32_t));
+            } break;
+            case 1: {
+                auto &v = comb.v1[gm.p2_val];
+                size_t old = v.size();
+                v.resize(old + gm.sz);
+                ifs.read(reinterpret_cast<char*>(v.data()+old),
+                         gm.sz * sizeof(uint64_t));
+            } break;
+            case 3: {
+                auto &v = comb.v3[gm.p2_val];
+                size_t old = v.size();
+                v.resize(old + gm.sz);
+                for (size_t i = 0; i < gm.sz; ++i) {
+                    unsigned char buf[16];
+                    ifs.read(reinterpret_cast<char*>(buf), 16);
+                    uint128_t x = 0;
+                    for (int b = 0; b < 16; ++b)
+                        x |= (uint128_t)buf[b] << (8*b);
+                    v[old + i] = x;
+                }
+            } break;
+            }
+        }
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    readTime += std::chrono::duration<double>(t1 - t0).count();
+
+    // sort
+    auto t2 = std::chrono::steady_clock::now();
+    if (mode == 0) for (auto &kv : comb.v0) LSD32(kv.second);
+    if (mode == 1) for (auto &kv : comb.v1) LSD64(kv.second);
+    if (mode == 3) for (auto &kv : comb.v3) LSD128(kv.second);
+    auto t3 = std::chrono::steady_clock::now();
+    sortTime += std::chrono::duration<double>(t3 - t2).count();
+
+    // collect sorted p2 keys
+    std::vector<uint16_t> p2vals;
+    if (mode == 0) for (auto &kv : comb.v0) p2vals.push_back(kv.first);
+    if (mode == 1) for (auto &kv : comb.v1) p2vals.push_back(kv.first);
+    if (mode == 3) for (auto &kv : comb.v3) p2vals.push_back(kv.first);
+    std::sort(p2vals.begin(), p2vals.end());
+
+    // serialize into a flat buffer
+    std::vector<char> out;
+    auto W = [&](const void *ptr, size_t n){
+        const char *c = reinterpret_cast<const char*>(ptr);
+        out.insert(out.end(), c, c + n);
+    };
+
+    FileHeader hdr;
+    std::memcpy(hdr.magic, "KMHD", 4);
+    hdr.k            = k_val;
+    hdr.p1_bits      = P1_BITS;
+    hdr.p2_bits      = P2_BITS;
+    hdr.genome_id_bits = 8;
+    hdr.suffix_mode  = (uint8_t)mode;
+    hdr.reserved[0] = hdr.reserved[1] = 0;
+    W(&hdr, sizeof(hdr));
+    W("kmhd", 4);
+
+    uint32_t gc = p2vals.size();
+    W(&gc, 4);
+    for (auto p2 : p2vals) {
+        W(&p2, 2);
+        uint32_t sz =
+          (mode==0 ? comb.v0[p2].size()
+         : mode==1 ? comb.v1[p2].size()
+                   : comb.v3[p2].size());
+        W(&sz, 4);
+    }
+    W("kmhd", 4);
+
+    for (auto p2 : p2vals) {
+        if (mode == 0) {
+            auto &v = comb.v0[p2];
+            W(v.data(), v.size()*4);
+        } else if (mode == 1) {
+            auto &v = comb.v1[p2];
+            W(v.data(), v.size()*8);
+        } else {
+            for (auto &x : comb.v3[p2]) {
+                unsigned char buf[16];
+                for (int j = 0; j < 16; ++j)
+                    buf[j] = (unsigned char)((x >> (8*j)) & 0xFF);
+                W(buf,16);
+            }
+        }
+    }
+
+    k_out = k_val;
+    return out;
+}
+
+// Main
 int main(int argc, char* argv[])
 {
     // These will hold the user-provided values for thread parameters
@@ -1191,23 +1154,8 @@ int main(int argc, char* argv[])
 
     std::vector<std::string> positionalArgs;
 
-    // ------------------------------------------------------
-    // PARSE COMMAND-LINE ARGUMENTS (NEW STYLE)
-    //
-    // Explanation of new parameters:
-    //  --k <VAL>                   : The k-mer size (required)
-    //  --reader_threads <VAL>      : Number of reader threads (mutually exclusive with --threads)
-    //  --package_manager_threads <VAL> : Number of package manager threads (mutually exclusive with --threads)
-    //  --threads <VAL>             : Total threads to be split approx as 2/3 readers, 1/3 PM (mutually exclusive with the above two)
-    //  --temp_files_dir <DIR>      : Directory for temporary/intermediate files (defaults to current directory if not specified)
-    //  --output_directory <DIR>    : Directory for final.bin and final.metadata (defaults to current directory if not specified)
-    //  All other parameters remain as in the original usage.
-    //
-    // If the user omits both --reader_threads/--package_manager_threads and --threads, it will be an error.
-    // ------------------------------------------------------
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
-
         if (arg == "-c") {
             g_useCanonical = true;
         }
@@ -1294,7 +1242,6 @@ int main(int argc, char* argv[])
                 }
             }
         }
-        // New named parameter for k
         else if (arg == "--k") {
             if (i + 1 < argc) {
                 g_k = std::stoi(argv[++i]);
@@ -1303,7 +1250,6 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
-        // New named parameter for reader threads
         else if (arg == "--reader_threads") {
             if (i + 1 < argc) {
                 userProvidedReaders = std::stoi(argv[++i]);
@@ -1312,7 +1258,6 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
-        // New named parameter for package manager threads
         else if (arg == "--package_manager_threads") {
             if (i + 1 < argc) {
                 userProvidedPMs = std::stoi(argv[++i]);
@@ -1321,7 +1266,6 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
-        // New named parameter for total threads (split into readers and PM)
         else if (arg == "--threads") {
             if (i + 1 < argc) {
                 userProvidedThreads = std::stoi(argv[++i]);
@@ -1330,7 +1274,6 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
-        // New named parameter for temp files directory
         else if (arg == "--temp_files_dir") {
             if (i + 1 < argc) {
                 g_tempFilesDir = argv[++i];
@@ -1339,7 +1282,6 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
-        // New named parameter for output directory
         else if (arg == "--output_directory") {
             if (i + 1 < argc) {
                 g_outputDirectory = argv[++i];
@@ -1349,12 +1291,11 @@ int main(int argc, char* argv[])
             }
         }
         else {
-            // Positional args (e.g., the MAF file)
             positionalArgs.push_back(arg);
         }
     }
 
-     if (!std::filesystem::exists(g_tempFilesDir)) {
+    if (!std::filesystem::exists(g_tempFilesDir)) {
         if (!std::filesystem::create_directories(g_tempFilesDir)) {
             std::cerr << "Error: unable to create temporary files directory: " << g_tempFilesDir << "\n";
             return 1;
@@ -1367,7 +1308,6 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Show usage if no MAF file is given
     if (positionalArgs.empty()) {
         std::cerr << "Usage:\n"
                   << "  " << argv[0] << " [ -c ]\n"
@@ -1391,28 +1331,23 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    // The MAF file is the first (and only) positional argument
     std::string mafFileOriginal = positionalArgs[0];
 
-    // Now decide how many threads for readers and PM.
     if (userProvidedThreads != -1 && (userProvidedReaders != -1 || userProvidedPMs != -1)) {
         std::cerr << "Error: --threads is mutually exclusive with --reader_threads and --package_manager_threads\n";
         return 1;
     }
     else if (userProvidedThreads != -1) {
-        // Split threads: 2/3 readers, 1/3 PM
         if (userProvidedThreads <= 0) {
             std::cerr << "Error: --threads must be > 0\n";
             return 1;
         }
-        // Simple approach:
-        g_numReaders = (2 * userProvidedThreads) / 3; 
+        g_numReaders = 0.3 * userProvidedThreads; 
         if (g_numReaders < 1) g_numReaders = 1;
         g_numPMs = userProvidedThreads - g_numReaders; 
         if (g_numPMs < 1) g_numPMs = 1;
     }
     else {
-        // Then user must have provided both reader_threads and package_manager_threads
         if (userProvidedReaders <= 0 || userProvidedPMs <= 0) {
             std::cerr << "Error: must provide --reader_threads <val> and --package_manager_threads <val>, or use --threads\n";
             return 1;
@@ -1421,12 +1356,10 @@ int main(int argc, char* argv[])
         g_numPMs = userProvidedPMs;
     }
 
-    // Check if k was set
     if (g_k <= 0) {
         std::cerr << "Error: k not specified (or invalid). Use --k <VAL>\n";
         return 1;
     }
-
     if (g_k > KMER_MAX_LENGTH) {
         std::cerr << "k too large (max " << KMER_MAX_LENGTH << ")\n";
         return 1;
@@ -1444,7 +1377,6 @@ int main(int argc, char* argv[])
         mafFileToProcess = decompressedFile;
     }
 
-    // If the user wants to purge intermediate files from a previous run, do it now
     if (g_purgeIntermediate) {
         purgeIntermediateFiles(g_binaryOutputFile);
     }
@@ -1494,8 +1426,6 @@ int main(int argc, char* argv[])
         }
 
         auto finalStart = std::chrono::steady_clock::now();
-
-        // final.bin path is now in output directory with user-specified name
         std::string finalBinPath = g_outputDirectory + "/" + g_binaryOutputFile;
         std::ofstream ofs(finalBinPath, std::ios::binary);
         if (!ofs) {
@@ -1523,6 +1453,7 @@ int main(int argc, char* argv[])
         }
         ofs.write("ENDM", 4);
         ofs.close();
+
         auto finalEnd = std::chrono::steady_clock::now();
         double finalDuration = std::chrono::duration<double>(finalEnd - finalStart).count();
         {
@@ -1560,13 +1491,20 @@ int main(int argc, char* argv[])
         }
         std::cout << "Aggregating done. Total kmers: " << totalKmers.load() << "\n";
 
+        
+        size_t maxId = 0;
+        for (auto &kv : g_genomeMap) maxId = std::max(maxId, (size_t)kv.second);
+        std::vector<std::string> gNames(maxId + 1);
+        for (auto &kv : g_genomeMap) gNames[kv.second] = kv.first;
+
+        
+
         std::vector<uint16_t> allBins;
         allBins.reserve(1 << P1_BITS);
         for (uint16_t i = 0; i < (1 << P1_BITS); i++) {
             allBins.push_back(i);
         }
         std::vector<std::string> allFiles;
-        // Now we only scan g_tempFilesDir for intermediate files
         for (auto &entry : std::filesystem::directory_iterator(g_tempFilesDir)) {
             if (!entry.is_regular_file()) continue;
             std::string fname = entry.path().filename().string();
@@ -1596,231 +1534,206 @@ int main(int argc, char* argv[])
         std::mutex outMutex;
         size_t nextBinIdx = 0;
         std::vector<std::thread> binThreads;
-        size_t threadCount = g_numPMs + g_numReaders;
+        size_t threadCount = (g_numPMs + g_numReaders);
         if (threadCount < 1) threadCount = 1;
 
-        for (size_t i = 0; i < threadCount; i++) {
-            binThreads.emplace_back([i, &outMutex, &allBins, &binMap, &nextBinIdx]() {
-                auto start = std::chrono::steady_clock::now();
-                while (true) {
-                    uint16_t p1val = 0xFFFF;
-                    {
-                        std::lock_guard<std::mutex> lk(outMutex);
-                        if (nextBinIdx >= allBins.size()) break;
-                        p1val = allBins[nextBinIdx++];
-                    }
-                    auto it = binMap.find(p1val);
-                    if (it == binMap.end() || it->second.empty()) {
-                        continue;
-                    }
-                    // Construct a "complete" bin file name in temp dir
-                    std::string outName = g_tempFilesDir + "/bin_" + std::to_string(p1val) + "_complete.bin";
-                    processBinFiles(p1val, it->second, outName);
-                    if (std::filesystem::exists(outName)) {
-                        uint64_t fileSize = std::filesystem::file_size(outName);
-                        g_binFileSizes[p1val] = fileSize;
-                    }
+      
+        std::unordered_map<uint16_t, std::vector<std::filesystem::path>> bins;
+        {
+            std::regex re(R"(bin_(\d+)_.*\.bin)");
+            for (auto &e : std::filesystem::directory_iterator(g_tempFilesDir)) {
+                if (!e.is_regular_file()) continue;
+                std::smatch m;
+                auto fn = e.path().filename().string();
+                if (std::regex_match(fn, m, re)) {
+                    uint16_t p1 = static_cast<uint16_t>(std::stoi(m[1].str()));
+                    bins[p1].push_back(e.path());
                 }
-                auto end = std::chrono::steady_clock::now();
-                double duration = std::chrono::duration<double>(end - start).count();
-                {
-                    std::lock_guard<std::mutex> lock(coutMutex);
-                    std::cout << "Bin thread " << i << " finished in " << duration << " seconds.\n";
-                }
-            });
-        }
-        for (auto &t : binThreads) {
-            t.join();
-        }
-
-        // Purge partial bin_X_*, not the "complete" ones
-        std::thread asyncPurge([](){
-            purgeIntermediateParts("TEST");
-        });
-        asyncPurge.detach();
-
-        uint64_t totalBinSizes = 0;
-        for (auto size : g_binFileSizes) {
-            totalBinSizes += size;
-        }
-        // Calculate the header overhead.
-        uint64_t overhead = 0;
-        overhead += 4;               // "BINF"
-        overhead += sizeof(g_k);     // g_k
-        overhead += 1;               // nIDs
-
-        for (const auto &name : g_genomeNames) {
-            overhead += 2;           // length
-            overhead += name.size();
-        }
-        overhead += 4;   // "ENDG"
-
-        int binCount = 0;
-        for (auto size : g_binFileSizes) {
-            if (size > 0) {
-                binCount++;
-            }
-        }
-        overhead += binCount * (4 + 2 + 4); // Each bin chunk has overhead in final.bin
-
-        uint64_t predictedFinalSize = totalBinSizes + overhead;
-        std::cout << "Predicted final.bin size: " << predictedFinalSize << " bytes.\n";
-
-        auto finalStart = std::chrono::steady_clock::now();
-
-        // final.bin path is now in output directory with user-specified name
-        std::string finalBinPath = g_outputDirectory + "/" + g_binaryOutputFile;
-        int fd = open(finalBinPath.c_str(), O_RDWR | O_CREAT, 0666);
-        if (fd < 0) {
-            std::cerr << "Error creating " << finalBinPath << " via open\n";
-            if (isGZ) removeFileIfExists(decompressedFile);
-            return 0;
-        }
-        if (ftruncate(fd, predictedFinalSize) != 0) {
-            std::cerr << "Error setting " << finalBinPath << " size with ftruncate\n";
-            close(fd);
-            if (isGZ) removeFileIfExists(decompressedFile);
-            return 0;
-        }
-
-        void* map_ptr = mmap(nullptr, predictedFinalSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (map_ptr == MAP_FAILED) {
-            std::cerr << "Error: mmap failed for " << finalBinPath << "\n";
-            close(fd);
-            if (isGZ) removeFileIfExists(decompressedFile);
-            return 0;
-        }
-        char* finalData = static_cast<char*>(map_ptr);
-        size_t offset = 0;
-
-        std::memcpy(finalData + offset, "BINF", 4);
-        offset += 4;
-        std::memcpy(finalData + offset, &g_k, sizeof(g_k));
-        offset += sizeof(g_k);
-        uint8_t nIDs = (uint8_t)g_genomeNames.size();
-        std::memcpy(finalData + offset, &nIDs, sizeof(nIDs));
-        offset += sizeof(nIDs);
-        for (const auto &nm : g_genomeNames) {
-            uint16_t len = (uint16_t)nm.size();
-            std::memcpy(finalData + offset, &len, sizeof(len));
-            offset += sizeof(len);
-            std::memcpy(finalData + offset, nm.data(), nm.size());
-            offset += nm.size();
-        }
-        std::memcpy(finalData + offset, "ENDG", 4);
-        offset += 4;
-
-        struct BinInfo {
-            uint16_t p1;
-            uint64_t fileSize;
-            uint64_t segmentOffset;
-        };
-
-        std::vector<BinInfo> binInfos;
-        binInfos.reserve(binCount);
-
-        for (uint16_t i = 0; i < (1 << P1_BITS); i++) {
-            if (g_binFileSizes[i] > 0) {
-                BinInfo info;
-                info.p1 = i;
-                info.fileSize = g_binFileSizes[i];
-                info.segmentOffset = offset;
-                offset += 4 + 2 + info.fileSize + 4;
-                binInfos.push_back(info);
             }
         }
 
-        if (offset != predictedFinalSize) {
-            std::cerr << "Warning: computed final size (" << predictedFinalSize 
-                      << ") does not match offset (" << offset << ")\n";
+        // 3) Create and write the global header of final.bin
+        const std::string finalBinPath = g_outputDirectory + "/" + g_binaryOutputFile;
+        {
+            int fd = ::open(finalBinPath.c_str(),
+                            O_RDWR | O_CREAT | O_TRUNC,
+                            0666);
+            if (fd < 0) {
+                std::cerr << "Error: cannot create " << finalBinPath << "\n";
+                return 1;
+            }
+
+            // write "BINF"
+            size_t offs = 0;
+            auto PW = [&](const void* p, size_t n) {
+                pwrite(fd, p, n, offs);
+                offs += n;
+            };
+
+            PW("BINF", 4);
+            // placeholder for k; we’ll patch this once
+            uint32_t k_placeholder = 0;
+            PW(&k_placeholder, sizeof(k_placeholder));
+
+            // genome‐name table
+            uint8_t nIDs = (uint8_t)gNames.size();
+            PW(&nIDs, 1);
+            for (auto &nm : gNames) {
+                uint16_t L = (uint16_t)nm.size();
+                PW(&L, 2);
+                PW(nm.data(), L);
+            }
+            PW("ENDG", 4);
+            ::close(fd);
         }
 
-        std::atomic<size_t> nextIndex(0);
-        auto worker = [&]() {
+        // track where the next packet can go
+        struct stat st; stat(finalBinPath.c_str(), &st);
+        std::atomic<uint64_t> nextOff(st.st_size), fileSz(st.st_size);
+        std::mutex offMu, metaMu;
+        std::ofstream metaOut(g_outputDirectory + "/final.metadata",
+                              std::ios::trunc);
+
+        // make a sorted list of p1 IDs to process
+        std::vector<uint16_t> p1list;
+        p1list.reserve(bins.size());
+        for (auto &kv : bins) p1list.push_back(kv.first);
+        std::sort(p1list.begin(), p1list.end());
+
+        std::vector<uint16_t> normals, outliers;
+        for (auto p1 : p1list) {
+            if (outlierBins.count(p1)) outliers.push_back(p1);
+            else                     normals.push_back(p1);
+        }
+
+        // interleave: after every N normals, insert one outlier
+        std::vector<uint16_t> interleaved;
+        size_t normalPerOut = normals.size() / (outliers.empty() ? 1 : outliers.size());
+        size_t ni = 0, oi = 0;
+        while (ni < normals.size() || oi < outliers.size()) {
+            for (size_t k = 0; k < normalPerOut && ni < normals.size(); ++k)
+                interleaved.push_back(normals[ni++]);
+            if (oi < outliers.size())
+                interleaved.push_back(outliers[oi++]);
+        }
+        while (ni < normals.size()) interleaved.push_back(normals[ni++]);
+
+        p1list.swap(interleaved);
+
+        std::atomic<size_t> idx(0);
+        if (threadCount == 0) threadCount = 1;
+
+        // 4) Worker that for each p1:
+        //    a) merges its bin files, sorts them via buildPayload()
+        //    b) patches global k into header once
+        //    c) reserves space in final.bin, writes "BINc", p1, sendfile payload, "BEND"
+        //    d) records offset in final.metadata, and asynchronously deletes temp files
+        std::vector<TimeStats> threadStats(threadCount);
+        auto worker = [&](int tid){
+            double read_time = 0, sort_time = 0, write_time = 0;
+            bool patchedK = false;
+        
+            int remainder_bits = 2 * g_k - P1_BITS - P2_BITS;
+            int payloadMode   = determineSuffixMode(remainder_bits);
+        
             while (true) {
-                size_t idx = nextIndex.fetch_add(1);
-                if (idx >= binInfos.size()) break;
-                BinInfo info = binInfos[idx];
-                size_t segOffset = info.segmentOffset;
-                std::memcpy(finalData + segOffset, "BINc", 4);
-                segOffset += 4;
-                std::memcpy(finalData + segOffset, &info.p1, sizeof(info.p1));
-                segOffset += sizeof(info.p1);
-                // The "complete" file is in g_tempFilesDir
-                std::string binFileName = g_tempFilesDir + "/bin_" + std::to_string(info.p1) + "_complete.bin";
-                std::ifstream ifs(binFileName, std::ios::binary);
-                if (ifs) {
-                    size_t bytesToCopy = info.fileSize;
-                    size_t bytesCopied = 0;
-                    while (bytesCopied < bytesToCopy) {
-                        ifs.read(finalData + segOffset + bytesCopied, bytesToCopy - bytesCopied);
-                        size_t count = ifs.gcount();
-                        if (count == 0) {
-                            std::cerr << "Warning: unexpected EOF when reading " << binFileName << "\n";
-                            break;
-                        }
-                        bytesCopied += count;
+                size_t i = idx.fetch_add(1);
+                if (i >= p1list.size()) break;
+                uint16_t p1 = p1list[i];
+                auto &files = bins[p1];
+                uint32_t local_k = 0;
+        
+                bool isOut = outlierBins.count(p1) > 0;
+                // if this is a slow bin, grab the mutex so no other thread
+                // can sort/write another outlier at the same time
+                if (isOut) {
+                    std::lock_guard<std::mutex> L(outlierMutex);
+                    // fall through into the normal processing code
+                }
+        
+                // a) build & sort payload
+                auto payload = buildPayload(p1, files, payloadMode,
+                                            local_k, read_time, sort_time);
+        
+                // b) patch global k (only once)
+                if (!patchedK) {
+                    int fd = ::open(finalBinPath.c_str(), O_WRONLY);
+                    pwrite(fd, &local_k, sizeof(local_k), 4);
+                    ::close(fd);
+                    patchedK = true;
+                }
+        
+                // c) reserve space
+                uint64_t segSz = 4 + 2 + payload.size() + 4;
+                uint64_t myOff;
+                {
+                    std::lock_guard<std::mutex> lk(offMu);
+                    myOff = nextOff.fetch_add(segSz);
+                    uint64_t cur = nextOff.load();
+                    if (cur > fileSz.load()) {
+                        fileSz.store(cur);
+                        int ffd = ::open(finalBinPath.c_str(), O_WRONLY);
+                        ftruncate(ffd, cur);
+                        ::close(ffd);
                     }
-                    segOffset += bytesCopied;
-                } else {
-                    std::cerr << "Error: cannot open " << binFileName << "\n";
                 }
-                std::memcpy(finalData + segOffset, "BEND", 4);
+                // record in metadata
+                {
+                    std::lock_guard<std::mutex> lk(metaMu);
+                    metaOut << p1 << " " << myOff << "\n";
+                }
+        
+                // d) write payload -> final.bin using std::ofstream
+                {
+                    auto t0 = std::chrono::steady_clock::now();
+                    std::ofstream ofs(finalBinPath,
+                                      std::ios::in | std::ios::out | std::ios::binary);
+                    if (!ofs) {
+                        std::cerr << "Error opening " << finalBinPath << " for writing\n";
+                        std::exit(1);
+                    }
+                    ofs.seekp(myOff);
+                    ofs.write("BINc", 4);
+                    ofs.write(reinterpret_cast<const char*>(&p1), sizeof(p1));
+                    ofs.write(payload.data(), payload.size());
+                    ofs.write("BEND", 4);
+                    ofs.flush();
+                    auto t1 = std::chrono::steady_clock::now();
+                    write_time += std::chrono::duration<double>(t1 - t0).count();
+                }
+        
+                // e) asynchronously delete the just-written bin files
+                std::vector<std::filesystem::path> to_remove = files;
+                std::thread([to_remove]() {
+                    for (auto &path : to_remove) {
+                        std::error_code ec;
+                        std::filesystem::remove(path, ec);
+                    }
+                }).detach();
             }
+        
+            threadStats[tid] = TimeStats{read_time, sort_time, write_time};
         };
+        
 
-        std::vector<std::thread> finalThreads;
-        for (size_t i = 0; i < (size_t)g_numReaders; i++) {
-            finalThreads.emplace_back(worker);
-        }
-        for (auto &t : finalThreads) {
-            t.join();
-        }
+        // 5) Launch writers
+        std::vector<std::thread> thr;
+        for (unsigned t = 0; t < threadCount; ++t)
+            thr.emplace_back(worker, t);
+        for (auto &t : thr) t.join();
+        metaOut.close();
 
-        if (msync(finalData, predictedFinalSize, MS_SYNC) != 0) {
-            std::cerr << "Warning: msync failed\n";
-        }
-        munmap(finalData, predictedFinalSize);
-        close(fd);
-
-        std::cout << g_binaryOutputFile << " created using mmap at " << finalBinPath << ".\n";
-
-        // Now also write final.metadata
-        {
-            std::string metaOutName = g_outputDirectory + "/final.metadata";
-            std::ofstream metaOut(metaOutName);
-            if (!metaOut) {
-                std::cerr << "Error creating " << metaOutName << "\n";
-            } else {
-                for (const auto &info : binInfos) {
-                    metaOut << info.p1 << " " << info.segmentOffset << "\n";
-                }
-            }
-            metaOut.close();
+        // 6) (Optional) print per-thread timings
+        for (unsigned t = 0; t < threadCount; ++t) {
+            auto &s = threadStats[t];
+            std::cout << "[TIMING][T" << t << "] "
+                      << "read="  << s.readTime  << "s, "
+                      << "sort="  << s.sortTime  << "s, "
+                      << "write=" << s.writeTime << "s\n";
         }
 
-        auto finalEnd = std::chrono::steady_clock::now();
-        double finalDuration = std::chrono::duration<double>(finalEnd - finalStart).count();
-        {
-            std::lock_guard<std::mutex> lock(coutMutex);
-            std::cout << "Final.bin creation took " << finalDuration << " seconds.\n";
-        }
-        std::cout << finalBinPath << " created.\n";
+        std::cout << "Done. final.bin written to " << finalBinPath << "\n";
     }
-
-    auto pre_remove = std::chrono::steady_clock::now();
-
-    if (isGZ) {
-        removeFileIfExists(decompressedFile);
-    }
-    if (g_purgeIntermediate) {
-        // We remove all "bin_" files in the temp directory
-        purgeIntermediateFiles(g_binaryOutputFile);
-    }
-
-    auto post_remove = std::chrono::steady_clock::now();
-    double final_remove = std::chrono::duration<double>(post_remove - pre_remove).count();
-    std::cout << "Remove took" << final_remove << " seconds.\n";
 
     return 0;
 }

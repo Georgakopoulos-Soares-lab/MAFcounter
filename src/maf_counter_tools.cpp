@@ -21,6 +21,8 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <chrono>
+
 //
 // For 128-bit support (boost)
 //
@@ -170,11 +172,10 @@ struct NextRecord {
 class FinalBinReader {
 public:
     FinalBinReader(const std::string &binPath,
-                   const std::string &metaPath,
-                   int k,
-                   uint16_t p1Start,
-                   uint16_t p1End)
-        : m_k(k), m_p1Start(p1Start), m_p1End(p1End)
+        const std::string &metaPath,
+        int k,
+        const std::vector<uint16_t> &p1List)
+    : m_k(k), m_p1List(p1List), m_currentP1Index(0)
     {
         m_ifs.open(binPath, std::ios::binary);
         if(!m_ifs) {
@@ -227,40 +228,20 @@ public:
         } else {
             // for big-K => we need metadata
             std::ifstream meta(metaPath);
-            if(!meta){
-                std::cerr<<"Cannot open metadata file: "<<metaPath<<"\n";
-                m_eof=true;return;
-            }
+            if(!meta) { m_eof=true; return; }
             std::vector<std::pair<uint16_t,uint64_t>> metaEntries;
-            std::string line;
-            while(std::getline(meta,line)){
-                if(line.empty()) continue;
-                std::istringstream iss(line);
-                uint16_t p1val;
-                uint64_t off;
-                if(!(iss >> p1val >> off)) continue;
-                metaEntries.push_back({p1val, off});
-            }
-            meta.close();
-            if(metaEntries.empty()){
-                std::cerr<<"Metadata is empty?\n";
-                m_eof=true;return;
+            uint16_t p1val; uint64_t off;
+            while(meta >> p1val >> off){
+                metaEntries.emplace_back(p1val,off);
             }
             std::sort(metaEntries.begin(), metaEntries.end(),
-                      [](auto &a, auto &b){return a.first < b.first;});
-            auto it = std::lower_bound(metaEntries.begin(), metaEntries.end(), p1Start,
-                [](const std::pair<uint16_t,uint64_t> &e, uint16_t val){
-                    return e.first < val;
-                }
-            );
-            if(it==metaEntries.end()){
-                m_eof=true;return;
+                      [](auto&a,auto&b){ return a.first<b.first; });
+            // build a lookup map
+            for(auto &e: metaEntries) {
+                m_metaMap[e.first] = e.second;
             }
-            m_ifs.seekg(it->second);
-            if(!m_ifs){
-                m_eof=true;return;
-            }
-            m_inBinBlock=false;
+            // prepare to read the first P1
+            startNextP1Block();
         }
     }
 
@@ -276,195 +257,154 @@ public:
 private:
     NextRecord getNextSmall()
     {
-        while(true){
-            if(m_eof) return {false,0,0,0};
-            if(m_mapReadCount>=m_mapSize){
-                m_eof=true;
-                return {false,0,0,0};
+        while (true) {
+            if (m_eof) 
+                return {false, 0, 0, 0};
+    
+            if (m_mapReadCount >= m_mapSize) {
+                m_eof = true;
+                return {false, 0, 0, 0};
             }
-            if(m_idx>=256){
-                // read key + 256 counts
-                uint32_t key32=0;
-                if(!m_ifs.read((char*)&key32,sizeof(key32))){
-                    m_eof=true;return {false,0,0,0};
+    
+            if (m_idx >= 256) {
+                // read next key + 256 counts
+                uint32_t key32 = 0;
+                if (!m_ifs.read(reinterpret_cast<char*>(&key32), sizeof(key32))) {
+                    m_eof = true; 
+                    return {false, 0, 0, 0};
                 }
-                if(!m_ifs.read((char*)m_counts.data(),256*sizeof(uint32_t))){
-                    m_eof=true;return {false,0,0,0};
+                if (!m_ifs.read(reinterpret_cast<char*>(m_counts.data()), 256 * sizeof(uint32_t))) {
+                    m_eof = true; 
+                    return {false, 0, 0, 0};
                 }
                 m_mapReadCount++;
-                m_idx=0;
-                m_currKmer = key32;  // fits into bottom bits of uint128_t
+                m_idx = 0;
+                m_currKmer = key32;
             }
-            while(m_idx<256 && m_counts[m_idx]==0){
-                m_idx++;
+    
+            // skip zero counts
+            while (m_idx < 256 && m_counts[m_idx] == 0) {
+                ++m_idx;
             }
-            if(m_idx>=256) continue; // read next entry
+            if (m_idx >= 256) 
+                continue;
+    
+            // build record
             NextRecord nr;
             nr.valid    = true;
             nr.kmer     = m_currKmer;
-            nr.genomeID = (uint8_t)m_idx;
-            nr.count    = m_counts[m_idx];
-            m_idx++;
-            uint16_t p1 = getP1Range(nr.kmer,m_k);
-            if(p1>=m_p1Start && p1<=m_p1End){
+            nr.genomeID = static_cast<uint8_t>(m_idx);
+            nr.count    = m_counts[m_idx++];
+            
+            // filter by this thread's P1 list
+            uint16_t p1 = getP1Range(nr.kmer, m_k);
+            if (std::binary_search(m_p1List.begin(), m_p1List.end(), p1)) {
                 return nr;
             }
+            // otherwise keep looping
         }
     }
+    void startNextP1Block() {
+        if (m_currentP1Index >= m_p1List.size()) {
+            m_eof = true;
+            return;
+        }
+        uint16_t p1 = m_p1List[m_currentP1Index++];
+        auto it = m_metaMap.find(p1);
+        if (it == m_metaMap.end()) {
+            // no such P1 in metadata: skip to next
+            startNextP1Block();
+            return;
+        }
+        m_ifs.seekg(it->second);
+        // now read that block header exactly as before:
+        char binC[4]; m_ifs.read(binC,4);           // "BINc"
+        m_ifs.read((char*)&m_blockP1,sizeof(m_blockP1)); // that P1
+        char kmhd[4]; m_ifs.read(kmhd,4);           // "KMHD"
+        FileHeader hdr; std::memcpy(hdr.magic,kmhd,4);
+        m_ifs.read((char*)&hdr.k,    sizeof(hdr.k));
+        m_ifs.read((char*)&hdr.p1_bits,sizeof(hdr.p1_bits));
+        m_ifs.read((char*)&hdr.p2_bits,sizeof(hdr.p2_bits));
+        m_ifs.read((char*)&hdr.genome_id_bits,sizeof(hdr.genome_id_bits));
+        m_ifs.read((char*)&hdr.suffix_mode,  sizeof(hdr.suffix_mode));
+        m_ifs.read((char*)&hdr.reserved[0], 2);
+        // read group descriptors:
+        char s1[4]; m_ifs.read(s1,4);             // "GRPS"
+        uint32_t groupCount; m_ifs.read((char*)&groupCount,sizeof(groupCount));
+        m_groups.clear(); m_groups.resize(groupCount);
+        for (auto &g : m_groups) {
+            m_ifs.read((char*)&g.p2,sizeof(g.p2));
+            m_ifs.read((char*)&g.sz,sizeof(g.sz));
+            g.loaded=false; g.idx=0;
+        }
+        char s2[4]; m_ifs.read(s2,4);             // "ENDS"
+        m_suffixMode = hdr.suffix_mode;
+        m_inBinBlock = true;
+        m_groupIndex = 0;
+    }
 
-    NextRecord getNextBig()
-    {
-        while(true){
-            if(m_eof) return {false,0,0,0};
-            if(!m_inBinBlock){
-                // read "BINc"
-                char binC[4];
-                if(!m_ifs.read(binC,4)){m_eof=true;return{false,0,0,0};}
-                if(std::strncmp(binC,"BINc",4)!=0){
-                    m_eof=true;return{false,0,0,0};
-                }
-                if(!m_ifs.read((char*)&m_blockP1,sizeof(m_blockP1))){
-                    m_eof=true;return{false,0,0,0};
-                }
-                if(m_blockP1>m_p1End){
-                    m_eof=true;return{false,0,0,0};
-                }
-                // read "KMHD"
-                char kmhd[4];
-                if(!m_ifs.read(kmhd,4)){m_eof=true;return{false,0,0,0};}
-                if(std::strncmp(kmhd,"KMHD",4)!=0){
-                    m_eof=true;return{false,0,0,0};
-                }
-                FileHeader hdr;
-                std::memcpy(hdr.magic, kmhd,4);
-                if(!m_ifs.read((char*)&hdr.k,sizeof(hdr.k))){
-                    m_eof=true;return{false,0,0,0};
-                }
-                if(!m_ifs.read((char*)&hdr.p1_bits,sizeof(hdr.p1_bits))){
-                    m_eof=true;return{false,0,0,0};
-                }
-                if(!m_ifs.read((char*)&hdr.p2_bits,sizeof(hdr.p2_bits))){
-                    m_eof=true;return{false,0,0,0};
-                }
-                if(!m_ifs.read((char*)&hdr.genome_id_bits,sizeof(hdr.genome_id_bits))){
-                    m_eof=true;return{false,0,0,0};
-                }
-                if(!m_ifs.read((char*)&hdr.suffix_mode,sizeof(hdr.suffix_mode))){
-                    m_eof=true;return{false,0,0,0};
-                }
-                if(!m_ifs.read((char*)&hdr.reserved[0],2)){
-                    m_eof=true;return{false,0,0,0};
-                }
-                // read "GRPS"
-                char s1[4];
-                if(!m_ifs.read(s1,4)){m_eof=true;return{false,0,0,0};}
-                uint32_t groupCount=0;
-                if(!m_ifs.read((char*)&groupCount,sizeof(groupCount))){
-                    m_eof=true;return{false,0,0,0};
-                }
-                m_groups.clear();
-                m_groups.resize(groupCount);
-                for(uint32_t i=0;i<groupCount;i++){
-                    if(!m_ifs.read((char*)&m_groups[i].p2,sizeof(m_groups[i].p2))){
-                        m_eof=true;return{false,0,0,0};
-                    }
-                    if(!m_ifs.read((char*)&m_groups[i].sz,sizeof(m_groups[i].sz))){
-                        m_eof=true;return{false,0,0,0};
-                    }
-                }
-                // read "ENDS"
-                char s2[4];
-                if(!m_ifs.read(s2,4)){m_eof=true;return{false,0,0,0};}
-                m_suffixMode = hdr.suffix_mode;
-                m_inBinBlock=true;
-                m_groupIndex=0;
+    NextRecord getNextBig() {
+        while (true) {
+            if (m_eof) return {false,0,0,0};
+            // if we're out of the current block, advance to the next P1
+            if (!m_inBinBlock) {
+                startNextP1Block();
+                if (m_eof) return {false,0,0,0};
             }
-            // skip done groups
-            while(m_groupIndex < m_groups.size() && m_groups[m_groupIndex].done()){
-                m_groupIndex++;
-            }
-            if(m_groupIndex>=m_groups.size()){
-                // read "BEND"
+            // skip fully done groups
+            while (m_groupIndex < m_groups.size() && m_groups[m_groupIndex].done())
+                ++m_groupIndex;
+            // if finished this block entirely, mark done and loop around
+            if (m_groupIndex >= m_groups.size()) {
                 char bend[4];
-                if(!m_ifs.read(bend,4)){m_eof=true;return{false,0,0,0};}
-                m_inBinBlock=false;
+                m_ifs.read(bend,4);  // "BEND"
+                m_inBinBlock = false;
                 continue;
             }
+            // load suffix data if not yet loaded
             auto &cg = m_groups[m_groupIndex];
-            if(!cg.loaded){
-                if(m_suffixMode==0){
-                    cg.data32.resize(cg.sz);
-                    if(!m_ifs.read((char*)cg.data32.data(), cg.sz*sizeof(uint32_t))){
-                        m_eof=true;return{false,0,0,0};
-                    }
-                } else if(m_suffixMode==1){
-                    cg.data64.resize(cg.sz);
-                    if(!m_ifs.read((char*)cg.data64.data(), cg.sz*sizeof(uint64_t))){
-                        m_eof=true;return{false,0,0,0};
-                    }
-                } else if(m_suffixMode==3){
-                    cg.data128.resize(cg.sz);
-                    if(!m_ifs.read((char*)cg.data128.data(), cg.sz*2*sizeof(uint64_t))){
-                        m_eof=true;return{false,0,0,0};
-                    }
-                } else {
-                    std::cerr<<"Unknown suffix_mode "<<(int)m_suffixMode<<"\n";
-                    m_eof=true;return{false,0,0,0};
+            if (!cg.loaded) {
+                switch(m_suffixMode) {
+                  case 0: cg.data32.resize(cg.sz);
+                          m_ifs.read((char*)cg.data32.data(), cg.sz*sizeof(uint32_t));
+                          break;
+                  case 1: cg.data64.resize(cg.sz);
+                          m_ifs.read((char*)cg.data64.data(), cg.sz*sizeof(uint64_t));
+                          break;
+                  case 3: cg.data128.resize(cg.sz);
+                          m_ifs.read((char*)cg.data128.data(), cg.sz*2*sizeof(uint64_t));
+                          break;
                 }
-                cg.loaded=true;
-                cg.idx=0;
+                cg.loaded = true;
+                cg.idx = 0;
             }
-            // read next from group
-            if(m_suffixMode==0){
-                if(cg.idx>=cg.data32.size()){
-                    cg.idx=cg.sz; 
-                    continue;
-                }
-                uint32_t val = cg.data32[cg.idx++];
-                uint8_t gID  = (uint8_t)(val & 0xFF);
-                uint64_t remainder = (val >> 8);
-                uint128_t fullK = reassembleKmer(m_blockP1,cg.p2,remainder,m_k);
-                uint16_t p1 = getP1Range(fullK,m_k);
-                if(p1>=m_p1Start && p1<=m_p1End){
-                    return {true,fullK,gID,1};
-                }
-            } else if(m_suffixMode==1){
-                if(cg.idx>=cg.data64.size()){
-                    cg.idx=cg.sz;
-                    continue;
-                }
-                uint64_t val = cg.data64[cg.idx++];
-                uint8_t gID  = (uint8_t)(val & 0xFF);
-                uint64_t remainder = (val >> 8);
-                uint128_t fullK = reassembleKmer(m_blockP1,cg.p2,remainder,m_k);
-                uint16_t p1 = getP1Range(fullK,m_k);
-                if(p1>=m_p1Start && p1<=m_p1End){
-                    return {true,fullK,gID,1};
-                }
+            // extract next record from this group
+            uint128_t fullK; uint8_t gID; uint32_t cnt=1;
+            if (m_suffixMode==0) {
+                uint32_t v = cg.data32[cg.idx++];
+                gID = v & 0xFF; uint64_t rem = v>>8;
+                fullK = reassembleKmer(m_blockP1, cg.p2, rem, m_k);
+            } else if (m_suffixMode==1) {
+                uint64_t v = cg.data64[cg.idx++];
+                gID = v & 0xFF; uint64_t rem = v>>8;
+                fullK = reassembleKmer(m_blockP1, cg.p2, rem, m_k);
             } else {
-                // suffixMode==3 => 128 bits
-                if(cg.idx>=cg.data128.size()){
-                    cg.idx=cg.sz;
-                    continue;
-                }
                 auto &arr = cg.data128[cg.idx++];
-                uint8_t gID = (uint8_t)(arr[0] & 0xFF);
-                uint128_t remainder = (((uint128_t)arr[1]) << 56)
-                                      | ((arr[0] >> 8) & 0x00FFFFFFFFFFFFFFULL);
-                uint128_t fullK = reassembleKmer(m_blockP1,cg.p2,remainder,m_k);
-                uint16_t p1 = getP1Range(fullK,m_k);
-                if(p1>=m_p1Start && p1<=m_p1End){
-                    return {true,fullK,gID,1};
-                }
+                gID = arr[0] & 0xFF;
+                uint128_t rem = (((uint128_t)arr[1])<<56)
+                                | ((arr[0]>>8)&0x00FFFFFFFFFFFFFFULL);
+                fullK = reassembleKmer(m_blockP1, cg.p2, rem, m_k);
             }
+            return { true, fullK, gID, cnt };
         }
     }
 
 private:
-    std::ifstream m_ifs;
-    bool m_eof=false;
-    bool m_smallKmode=false;
-    int  m_k=0;
+
+    int             m_k;
+    bool            m_smallKmode;
+    bool            m_eof=false;
+    std::ifstream   m_ifs;
 
     // for small-K
     uint64_t m_mapSize=0;
@@ -472,11 +412,15 @@ private:
     std::array<uint32_t,256> m_counts{};
     uint128_t m_currKmer=0;
     int m_idx=256;
+    
 
     // for big-K
-    bool m_inBinBlock=false;
-    uint16_t m_blockP1=0;
-    uint8_t  m_suffixMode=0;
+    std::vector<uint16_t>                        m_p1List;
+    size_t                                        m_currentP1Index;
+    std::unordered_map<uint16_t,uint64_t>         m_metaMap;
+    bool                                          m_inBinBlock=false;
+    uint16_t                                      m_blockP1=0;
+    uint8_t                                       m_suffixMode=0;
 
     struct GroupData {
         uint16_t p2=0;
@@ -488,11 +432,9 @@ private:
         size_t idx=0;
         bool done() const {return idx>=sz;}
     };
-    std::vector<GroupData> m_groups;
-    size_t m_groupIndex=0;
 
-    uint16_t m_p1Start=0;
-    uint16_t m_p1End=0;
+    std::vector<GroupData>                       m_groups;
+    size_t                                        m_groupIndex=0;
 };
 
 // -------------------------------------------------------------------------------------------
@@ -530,21 +472,18 @@ struct TopStdRecord {
 };
 
 static std::vector<TopStdRecord> g_threadTopResults; // for doComputeTopStds
-struct ThreadRange {
-    uint16_t p1Start;
-    uint16_t p1End;
-};
+
 
 static int g_topCount=0;       
 static int g_numThreads=1;     
 
 // Worker thread for --std
 static void workerThread_std(int threadID,
-                             ThreadRange range,
-                             const std::string &binPath,
-                             const std::string &metaPath)
+    const std::vector<uint16_t> &p1List,
+    const std::string &binPath,
+    const std::string &metaPath)
 {
-    FinalBinReader reader(binPath, metaPath, g_k, range.p1Start, range.p1End);
+    FinalBinReader reader(binPath, metaPath, g_k, p1List);
     if(!reader.good()){
         // fill with zero
         for(int i=0; i<g_topCount;i++){
@@ -616,123 +555,113 @@ static void workerThread_std(int threadID,
     }
 }
 
-// doComputeTopStds
 static int doComputeTopStds(const std::string &binPath,
                             const std::string &metaPath,
                             int topCount,
                             int numThreads)
 {
-    // read final.bin header
+    // 1) Read header & genome names (unchanged)
+    std::ifstream ifs(binPath, std::ios::binary);
+    if (!ifs) { std::cerr<<"Cannot open "<<binPath<<"\n"; return 1; }
+    char mg[4];
+    ifs.read(mg,4);
+    if (std::strncmp(mg,"BINF",4)!=0) { std::cerr<<"Not a valid BINF\n"; return 1; }
+    ifs.read((char*)&g_k,sizeof(g_k));
+    ifs.read((char*)&g_nIDs,sizeof(g_nIDs));
+    g_genomeNames.resize(g_nIDs);
+    for(uint8_t i=0;i<g_nIDs;i++){
+    uint16_t len; ifs.read((char*)&len,sizeof(len));
+    g_genomeNames[i].resize(len);
+    ifs.read(&g_genomeNames[i][0], len);
+    }
+    // skip ENDG
+    ifs.read(mg,4);
+
+    // 2) Load metadata *into a hash map*, in file order:
+    std::unordered_map<uint16_t,uint64_t> metaMap;
     {
-        std::ifstream ifs(binPath,std::ios::binary);
-        if(!ifs){
-            std::cerr<<"Cannot open "<<binPath<<"\n";
-            return 1;
-        }
-        {
-            char mg[4];
-            if(!ifs.read(mg,4)){
-                std::cerr<<"Cannot read magic\n";return 1;
-            }
-            if(std::strncmp(mg,"BINF",4)!=0){
-                std::cerr<<"Not a valid BINF\n";return 1;
-            }
-        }
-        {
-            if(!ifs.read((char*)&g_k,sizeof(g_k))){
-                std::cerr<<"Cannot read k\n";return 1;
-            }
-            if(g_k<1||g_k> KMER_MAX_LENGTH){
-                std::cerr<<"Invalid k\n";return 1;
-            }
-        }
-        {
-            if(!ifs.read((char*)&g_nIDs,sizeof(g_nIDs))){
-                std::cerr<<"Cannot read nIDs\n";return 1;
-            }
-            if(g_nIDs<1){
-                std::cerr<<"No genome IDs?\n";return 1;
-            }
-        }
-        g_genomeNames.resize(g_nIDs);
-        for(uint8_t i=0;i<g_nIDs;i++){
-            uint16_t len=0;
-            if(!ifs.read((char*)&len,sizeof(len))){
-                std::cerr<<"Cannot read genome name length\n";return 1;
-            }
-            g_genomeNames[i].resize(len);
-            if(!ifs.read((char*)g_genomeNames[i].data(),len)){
-                std::cerr<<"Cannot read genome name\n";return 1;
-            }
-        }
-        {
-            char sentinel[4];
-            if(!ifs.read(sentinel,4)){
-                std::cerr<<"Cannot read ENDG\n";return 1;
-            }
-            if(std::strncmp(sentinel,"ENDG",4)!=0){
-                std::cerr<<"Missing ENDG\n";return 1;
-            }
-        }
+    std::ifstream meta(metaPath);
+    if(!meta){ std::cerr<<"Cannot open metadata file\n"; return 1; }
+    uint16_t p1; uint64_t off;
+    std::string line;
+    while(std::getline(meta,line)){
+    if(line.empty()) continue;
+    std::istringstream iss(line);
+    if(!(iss>>p1>>off)) continue;
+    metaMap[p1] = off;
+    }
+    }
+    // 3) Extract the on-disk P1 keys into a vector (in insertion/file order):
+    std::vector<uint16_t> allP1;
+    allP1.reserve(metaMap.size());
+    for(auto &kv : metaMap){
+    allP1.push_back(kv.first);
+    }
+    // we assume that iteration of std::unordered_map here reflects the
+    // original file order; if you care about the literal file order,
+    // read into a vector<pair<>> directly instead of a map.
+
+    // 4) Partition allP1 contiguously across threads:
+    int T = std::max(1, numThreads);
+    std::vector<std::vector<uint16_t>> threadP1s(T);
+    int per = (allP1.size()+T-1)/T;
+    for(int t=0; t<T; t++){
+    int st = t*per, ed = std::min<int>(st+per, allP1.size());
+    threadP1s[t].assign(allP1.begin()+st, allP1.begin()+ed);
     }
 
     g_topCount = topCount;
     g_numThreads = numThreads;
     g_threadTopResults.resize(g_topCount*g_numThreads);
 
+    
     int totalP1 = (1<<P1_BITS);
-    int chunkSize = (totalP1 + g_numThreads -1)/g_numThreads;
-    std::vector<ThreadRange> ranges(g_numThreads);
-    for(int i=0;i<g_numThreads;i++){
-        uint16_t st = (uint16_t)(i*chunkSize);
-        uint16_t ed = (uint16_t)std::min<int>((i+1)*chunkSize-1, totalP1-1);
-        ranges[i]={st,ed};
-    }
-
-    std::vector<std::thread> threads;
-    for(int i=0;i<g_numThreads;i++){
-        threads.emplace_back(workerThread_std, i, ranges[i], binPath, metaPath);
-    }
-    for(auto &t: threads){
-        t.join();
-    }
-    // gather top
-    std::sort(g_threadTopResults.begin(), g_threadTopResults.end(),
-              [](auto &a, auto &b){return a.stddev > b.stddev;});
-    if((int)g_threadTopResults.size()>g_topCount){
-        g_threadTopResults.resize(g_topCount);
-    }
-
-    std::string outName = "top_"+std::to_string(g_topCount)+"_std.txt";
-    std::ofstream ofs(outName);
-    if(!ofs){
-        std::cerr<<"Cannot create "<<outName<<"\n";
-        return 1;
-    }
-    ofs << "# kmer, stddev, counts\n";
-    for(auto &rec: g_threadTopResults){
-        if(rec.stddev<=0.0) break;
-        KmerResult kr = decodeKmer128(rec.kmer, g_k);
-        ofs<< kr.kmer << ", " << rec.stddev << ", ";
-        bool first=true;
-        for(uint8_t gid=0; gid<g_nIDs; gid++){
-            uint32_t c= rec.counts[gid];
-            if(c>0){
-                if(!first) ofs<<"; ";
-                first=false;
-                if(gid<g_genomeNames.size()){
-                    ofs << g_genomeNames[gid] <<": "<< c;
-                } else {
-                    ofs << "UnknownID#"<<(int)gid <<": "<< c;
-                }
-            }
+    int chunkSize = (totalP1 + g_numThreads - 1)/g_numThreads;
+    std::vector<std::vector<uint16_t>> p1Lists(g_numThreads);
+    for(int t=0; t<g_numThreads; t++){
+        int start = t*chunkSize;
+        int end   = std::min((t+1)*chunkSize, totalP1);
+        for(int p1 = start; p1 < end; ++p1){
+            p1Lists[t].push_back((uint16_t)p1);
         }
-        ofs<<"\n";
     }
-    ofs.close();
-    std::cout<<"Wrote "<<outName<<" with up to "<<g_topCount<<" highest-stddev k-mers.\n";
+
+    // launch threads
+    std::vector<std::thread> threads;
+    for(int t=0; t<g_numThreads; t++){
+        threads.emplace_back(workerThread_std,
+                             t,
+                             std::cref(p1Lists[t]),
+                             binPath,
+                             metaPath);
+    }
+    for(auto &th: threads) th.join();
+
+    // 7) Gather & output (unchanged)
+    std::sort(g_threadTopResults.begin(), g_threadTopResults.end(),
+    [](auto &a, auto &b){ return a.stddev > b.stddev; });
+    if((int)g_threadTopResults.size() > g_topCount)
+    g_threadTopResults.resize(g_topCount);
+
+    std::ofstream ofs("top_"+std::to_string(g_topCount)+"_std.txt");
+    ofs << "# kmer, stddev, counts\n";
+    for(auto &rec : g_threadTopResults){
+    if(rec.stddev <= 0.0) break;
+    auto kr = decodeKmer128(rec.kmer, g_k);
+    ofs << kr.kmer << ", " << rec.stddev << ", ";
+    bool first=true;
+    for(uint8_t gid=0; gid<g_nIDs; gid++){
+    if(rec.counts[gid]==0) continue;
+    if(!first) ofs << "; ";
+    first = false;
+    ofs << g_genomeNames[gid] << ": " << rec.counts[gid];
+    }
+    ofs << "\n";
+    }
     return 0;
 }
+
+
 
 // -------------------------------------------------------------------------------------------
 // Expression parsing for --expr
@@ -1002,12 +931,12 @@ static size_t computeLineSize(const std::string &kmerStr,
 
 // pass1
 static void p1SizeComputerWorker_expr(int threadID,
-                                      ThreadRange range,
-                                      const std::string &binPath,
-                                      const std::string &metaPath,
-                                      const std::function<bool(const std::vector<uint32_t>&)> &exprFn)
+    const std::vector<uint16_t> &p1List,
+    const std::string &binPath,
+    const std::string &metaPath,
+    const std::function<bool(const std::vector<uint32_t>&)> &exprFn)
 {
-    FinalBinReader reader(binPath, metaPath, g_k, range.p1Start, range.p1End);
+    FinalBinReader reader(binPath, metaPath, g_k, p1List);
     if(!reader.good()) return;
     bool haveCurr=false;
     uint128_t currKmer=0;
@@ -1092,13 +1021,13 @@ static void buildLine(char* dest,
 
 // pass2
 static void p1WriteWorker_expr(int threadID,
-                               ThreadRange range,
-                               const std::string &binPath,
-                               const std::string &metaPath,
-                               const std::function<bool(const std::vector<uint32_t>&)> &exprFn,
-                               char* mappedPtr)
+    const std::vector<uint16_t> &p1List,
+    const std::string &binPath,
+    const std::string &metaPath,
+    const std::function<bool(const std::vector<uint32_t>&)> &exprFn,
+    char* mappedPtr)
 {
-    FinalBinReader reader(binPath, metaPath, g_k, range.p1Start, range.p1End);
+    FinalBinReader reader(binPath, metaPath, g_k, p1List);
     if(!reader.good()) return;
 
     bool haveCurr=false;
@@ -1214,26 +1143,29 @@ static int doComputeExpr(const std::string &binPath,
     }
     g_numThreads= std::max(numThreads,1);
 
-    int totalP1=(1<<P1_BITS);
-    int chunkSize=(totalP1+g_numThreads-1)/g_numThreads;
-    std::vector<ThreadRange> thrRanges(g_numThreads);
-    for(int i=0;i<g_numThreads;i++){
-        uint16_t st=(uint16_t)(i*chunkSize);
-        uint16_t ed=(uint16_t)std::min<int>((i+1)*chunkSize-1,totalP1-1);
-        thrRanges[i]={st,ed};
+    // build p1Lists
+    int totalP1 = (1<<P1_BITS);
+    int chunkSize = (totalP1 + numThreads - 1)/numThreads;
+    std::vector<std::vector<uint16_t>> p1Lists(numThreads);
+    for(int t=0; t<numThreads; t++){
+        int start = t*chunkSize;
+        int end   = std::min((t+1)*chunkSize, totalP1);
+        for(int p1 = start; p1 < end; ++p1)
+            p1Lists[t].push_back((uint16_t)p1);
     }
 
     // pass1
     {
         std::vector<std::thread> threads;
-        for(int t=0;t<g_numThreads;t++){
+        for(int t=0; t<numThreads; t++){
             threads.emplace_back(p1SizeComputerWorker_expr,
-                                 t, thrRanges[t], binPath, metaPath,
+                                 t,
+                                 std::cref(p1Lists[t]),
+                                 binPath,
+                                 metaPath,
                                  std::cref(exprFn));
         }
-        for(auto &th: threads){
-            th.join();
-        }
+        for(auto &th: threads) th.join();
     }
 
     // prefix sum
@@ -1267,16 +1199,16 @@ static int doComputeExpr(const std::string &binPath,
     // pass2
     {
         std::vector<std::thread> threads;
-        for(int t=0;t<g_numThreads;t++){
+        for(int t=0; t<numThreads; t++){
             threads.emplace_back(p1WriteWorker_expr,
-                                 t, thrRanges[t],
-                                 binPath, metaPath,
+                                 t,
+                                 std::cref(p1Lists[t]),
+                                 binPath,
+                                 metaPath,
                                  std::cref(exprFn),
                                  mappedPtr);
         }
-        for(auto &th: threads){
-            th.join();
-        }
+        for(auto &th: threads) th.join();
     }
 
     msync(mappedPtr, totalBytes, MS_SYNC);
@@ -1329,11 +1261,11 @@ static void updatePartial(PartialGstats &p, const std::vector<uint32_t> &counts)
 }
 
 static void workerThread_gstats(int threadID,
-                                ThreadRange range,
-                                const std::string &binPath,
-                                const std::string &metaPath)
+    const std::vector<uint16_t> &p1List,
+    const std::string &binPath,
+    const std::string &metaPath)
 {
-    FinalBinReader reader(binPath, metaPath, g_k, range.p1Start, range.p1End);
+    FinalBinReader reader(binPath, metaPath, g_k, p1List);
     if(!reader.good()) return;
     bool haveCurr=false;
     uint128_t currKmer=0;
@@ -1425,24 +1357,27 @@ static int doComputeGstats(const std::string &binPath,
         initPartialGstats(g_threadPartials[t], g_nIDs);
     }
 
-    int totalP1=(1<<P1_BITS);
-    int chunkSize= (totalP1+g_numThreads-1)/g_numThreads;
-    std::vector<ThreadRange> ranges(g_numThreads);
-    for(int i=0;i<g_numThreads;i++){
-        uint16_t st=(uint16_t)(i*chunkSize);
-        uint16_t ed=(uint16_t)std::min<int>((i+1)*chunkSize-1, totalP1-1);
-        ranges[i]={st,ed};
+    // build p1Lists
+    int totalP1 = (1<<P1_BITS);
+    int chunkSize = (totalP1 + numThreads - 1)/numThreads;
+    std::vector<std::vector<uint16_t>> p1Lists(numThreads);
+    for(int t=0; t<numThreads; t++){
+        int start = t*chunkSize;
+        int end   = std::min((t+1)*chunkSize, totalP1);
+        for(int p1 = start; p1 < end; ++p1)
+            p1Lists[t].push_back((uint16_t)p1);
     }
 
-    {
-        std::vector<std::thread> threads;
-        for(int i=0;i<g_numThreads;i++){
-            threads.emplace_back(workerThread_gstats,i,ranges[i],binPath,metaPath);
-        }
-        for(auto &t: threads){
-            t.join();
-        }
+    // launch threads
+    std::vector<std::thread> threads;
+    for(int t=0; t<numThreads; t++){
+        threads.emplace_back(workerThread_gstats,
+                             t,
+                             std::cref(p1Lists[t]),
+                             binPath,
+                             metaPath);
     }
+    for(auto &th: threads) th.join();
 
     // merge partials
     PartialGstats global;
@@ -1561,180 +1496,209 @@ static uint128_t encodeKmer(const std::string &kmer){
     return val;
 }
 
-static int doQuery(const std::string &binPath,
-                   const std::string &metaPath,
-                   const std::vector<std::string> &kmersToSearch,
-                   int numThreads)
+#include <chrono>    // at top of file
+
+static int doQuery(
+    const std::string &binPath,
+    const std::string &metaPath,
+    const std::vector<std::string> &kmersToSearch,
+    int numThreads)
 {
-    // read final.bin header
-    {
-        std::ifstream ifs(binPath,std::ios::binary);
-        if(!ifs){
-            std::cerr<<"Cannot open "<<binPath<<"\n";
+    // --- 1) Read header from final.bin (unchanged) ---
+    std::ifstream ifs(binPath, std::ios::binary);
+    if (!ifs) {
+        std::cerr << "Cannot open " << binPath << "\n";
+        return 1;
+    }
+    char mg[4];
+    if (!ifs.read(mg, 4) || std::strncmp(mg, "BINF", 4) != 0) {
+        std::cerr << "Not a valid BINF\n";
+        return 1;
+    }
+    ifs.read((char *)&g_k, sizeof(g_k));
+    if (g_k < 1 || g_k > KMER_MAX_LENGTH) {
+        std::cerr << "Invalid k\n";
+        return 1;
+    }
+    ifs.read((char *)&g_nIDs, sizeof(g_nIDs));
+    g_genomeNames.resize(g_nIDs);
+    for (uint8_t i = 0; i < g_nIDs; i++) {
+        uint16_t len = 0;
+        if (!ifs.read((char *)&len, sizeof(len))) {
+            std::cerr << "Cannot read genome name length\n";
             return 1;
         }
-        char mg[4];
-        if(!ifs.read(mg,4)){
-            std::cerr<<"Cannot read magic\n";return 1;
-        }
-        if(std::strncmp(mg,"BINF",4)!=0){
-            std::cerr<<"Not a valid BINF\n";return 1;
-        }
-        if(!ifs.read((char*)&g_k,sizeof(g_k))){
-            std::cerr<<"Cannot read k\n";return 1;
-        }
-        if(g_k<1||g_k> KMER_MAX_LENGTH){
-            std::cerr<<"Invalid k\n";return 1;
-        }
-        if(!ifs.read((char*)&g_nIDs,sizeof(g_nIDs))){
-            std::cerr<<"Cannot read nIDs\n";return 1;
-        }
-        if(g_nIDs<1){
-            std::cerr<<"No genome IDs\n";return 1;
-        }
-        g_genomeNames.resize(g_nIDs);
-        for(uint8_t i=0;i<g_nIDs;i++){
-            uint16_t len=0;
-            if(!ifs.read((char*)&len,sizeof(len))){
-                std::cerr<<"Cannot read genome name length\n";return 1;
-            }
-            g_genomeNames[i].resize(len);
-            if(!ifs.read((char*)g_genomeNames[i].data(),len)){
-                std::cerr<<"Cannot read genome name\n";return 1;
-            }
-        }
-        {
-            char sentinel[4];
-            if(!ifs.read(sentinel,4)){
-                std::cerr<<"Cannot read ENDG\n";return 1;
-            }
-            if(std::strncmp(sentinel,"ENDG",4)!=0){
-                std::cerr<<"Missing ENDG\n";return 1;
-            }
+        g_genomeNames[i].resize(len);
+        if (!ifs.read(&g_genomeNames[i][0], len)) {
+            std::cerr << "Cannot read genome name\n";
+            return 1;
         }
     }
+    if (!ifs.read(mg, 4) || std::strncmp(mg, "ENDG", 4) != 0) {
+        std::cerr << "Missing ENDG\n";
+        return 1;
+    }
 
-    // encode queries
+    // --- 2) Build queryMap ---
     std::unordered_map<uint128_t, std::string> queryMap;
-    for(auto &kmer: kmersToSearch){
-        if(!validateKmer(kmer,g_k)){
-            std::cerr<<"Warning: invalid k-mer '"<<kmer<<"' skipped.\n";
+    queryMap.reserve(kmersToSearch.size());
+    for (auto &kmer : kmersToSearch) {
+        if (!validateKmer(kmer, g_k)) {
+            std::cerr << "Warning: invalid k-mer '" << kmer << "' skipped.\n";
             continue;
         }
-        uint128_t val= encodeKmer(kmer);
-        queryMap[val]= kmer; 
+        queryMap[encodeKmer(kmer)] = kmer;
     }
-    if(queryMap.empty()){
-        std::cerr<<"No valid queries.\n";
+    if (queryMap.empty()) {
+        std::cerr << "No valid queries.\n";
         return 0;
     }
-    // We'll keep final counts in resultCounts
-    std::unordered_map<uint128_t, std::vector<uint32_t>> resultCounts;
-    resultCounts.reserve(queryMap.size());
-    for(auto &kv: queryMap){
-        resultCounts[kv.first].resize(g_nIDs,0);
+
+    // --- 3) Split queries across threads (one thread per query, capped by numThreads) ---
+    int Q = queryMap.size();
+    int T = std::min(numThreads, Q);
+
+    // turn queryMap into a vector for indexing
+    std::vector<std::pair<uint128_t, std::string>> queries;
+    queries.reserve(Q);
+    for (auto &kv : queryMap) {
+        queries.emplace_back(kv.first, kv.second);
     }
 
-    // per-thread local
+    // assign each query to a thread in round-robin fashion
+    std::vector<std::vector<uint128_t>> threadQueries(T);
+    for (int i = 0; i < Q; i++) {
+        threadQueries[i % T].push_back(queries[i].first);
+    }
+
+    // build per-thread lists of exactly the P1 bins needed (deduplicated)
+    std::vector<std::vector<uint16_t>> p1Lists(T);
+    for (int t = 0; t < T; t++) {
+        std::set<uint16_t> s;
+        for (auto code : threadQueries[t]) {
+            s.insert(getP1Range(code, g_k));
+        }
+        p1Lists[t].assign(s.begin(), s.end());
+    }
+
+    // prepare per-thread local counters only for its queries
     struct LocalQ {
-        std::unordered_map<uint128_t,std::vector<uint32_t>> localC;
+        std::unordered_map<uint128_t, std::vector<uint32_t>> localC;
     };
-    std::vector<LocalQ> localVec(numThreads);
-    for(int t=0;t<numThreads;t++){
-        localVec[t].localC.reserve(queryMap.size());
-        for(auto &kv: queryMap){
-            localVec[t].localC[kv.first].resize(g_nIDs,0);
+    std::vector<LocalQ> localVec(T);
+    for (int t = 0; t < T; t++) {
+        auto &mv = localVec[t].localC;
+        mv.reserve(threadQueries[t].size());
+        for (auto code : threadQueries[t]) {
+            mv[code].assign(g_nIDs, 0);
         }
     }
 
-    auto threadFunc=[&](int threadID, ThreadRange rng){
-        FinalBinReader reader(binPath, metaPath, g_k, rng.p1Start, rng.p1End);
-        if(!reader.good()) return;
-        bool haveCurr=false;
-        uint128_t currVal=0;
-        std::vector<uint32_t> counts(g_nIDs,0);
+    // global resultCounts for merging
+    std::unordered_map<uint128_t, std::vector<uint32_t>> resultCounts;
+    resultCounts.reserve(queryMap.size());
+    for (auto &kv : queryMap) {
+        resultCounts[kv.first].assign(g_nIDs, 0);
+    }
 
-        auto flush=[&](){
-            auto it= localVec[threadID].localC.find(currVal);
-            if(it!= localVec[threadID].localC.end()){
-                for(int i=0;i<(int)g_nIDs;i++){
-                    it->second[i]+= counts[i];
+    // adjust actual thread count
+    numThreads = T;
+
+    // --- 4) Start timing ---
+    auto t0 = std::chrono::steady_clock::now();
+
+    // --- 5) Worker lambda ---
+    auto threadFunc = [&](int threadID) {
+        FinalBinReader reader(binPath, metaPath, g_k, p1Lists[threadID]);
+        if (!reader.good()) return;
+
+        bool haveCurr = false;
+        uint128_t currVal = 0;
+        std::vector<uint32_t> counts(g_nIDs, 0);
+
+        auto flush = [&]() {
+            auto it = localVec[threadID].localC.find(currVal);
+            if (it != localVec[threadID].localC.end()) {
+                for (int i = 0; i < g_nIDs; i++) {
+                    it->second[i] += counts[i];
                 }
             }
         };
 
-        while(true){
-            NextRecord nr= reader.getNext();
-            if(!nr.valid){
-                if(haveCurr) flush();
+        while (true) {
+            NextRecord nr = reader.getNext();
+            if (!nr.valid) {
+                if (haveCurr) flush();
                 break;
             }
-            if(!haveCurr){
-                haveCurr=true;
-                currVal= nr.kmer;
-                std::fill(counts.begin(), counts.end(),0);
-                counts[nr.genomeID]+= nr.count;
+            if (!haveCurr) {
+                haveCurr = true;
+                currVal = nr.kmer;
+                std::fill(counts.begin(), counts.end(), 0);
+            }
+            if (nr.kmer == currVal) {
+                counts[nr.genomeID] += nr.count;
             } else {
-                if(nr.kmer==currVal){
-                    counts[nr.genomeID]+= nr.count;
-                } else {
-                    flush();
-                    currVal= nr.kmer;
-                    std::fill(counts.begin(), counts.end(),0);
-                    counts[nr.genomeID]+= nr.count;
-                }
+                flush();
+                currVal = nr.kmer;
+                std::fill(counts.begin(), counts.end(), 0);
+                counts[nr.genomeID] = nr.count;
             }
         }
     };
 
-    int totalP1=(1<<P1_BITS);
-    int chunkSize=(totalP1+numThreads-1)/numThreads;
-    std::vector<ThreadRange> thrRanges(numThreads);
-    for(int i=0;i<numThreads;i++){
-        uint16_t st=(uint16_t)(i*chunkSize);
-        uint16_t ed=(uint16_t)std::min<int>((i+1)*chunkSize-1, totalP1-1);
-        thrRanges[i]={st,ed};
-    }
-
+    // --- 6) Launch threads ---
     std::vector<std::thread> threads;
-    for(int i=0;i<numThreads;i++){
-        threads.emplace_back(threadFunc, i, thrRanges[i]);
-    }
-    for(auto &t: threads){
-        t.join();
+    threads.reserve(numThreads);
+    for (int t = 0; t < numThreads; t++) {
+        threads.emplace_back(threadFunc, t);
     }
 
-    // merge local => global
-    for(int t=0;t<numThreads;t++){
-        for(auto &kv: localVec[t].localC){
-            auto &glob= resultCounts[kv.first];
+    // --- 7) Join threads ---
+    for (auto &th : threads) {
+        th.join();
+    }
+
+    // --- 8) Stop timing & report ---
+    auto t1 = std::chrono::steady_clock::now();
+    auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    std::cout << "doQuery total time: " << ms << " ms\n";
+
+    // --- 9) Merge local results into global ---
+    for (int t = 0; t < numThreads; t++) {
+        for (auto &kv : localVec[t].localC) {
+            auto &glob = resultCounts[kv.first];
             auto &loc = kv.second;
-            for(int i=0;i<(int)g_nIDs;i++){
-                glob[i]+= loc[i];
+            for (int i = 0; i < g_nIDs; i++) {
+                glob[i] += loc[i];
             }
         }
     }
 
-    // print
-    for(auto &kv: queryMap){
-        auto &kVal = kv.first;
-        auto &kStr = kv.second;
-        auto &cnts = resultCounts[kVal];
-        std::cout<< kStr <<": ";
-        bool first=true;
-        for(int i=0;i<(int)g_nIDs;i++){
-            if(!first) std::cout<<", ";
-            first=false;
-            if(i<(int)g_genomeNames.size()){
-                std::cout<< g_genomeNames[i] <<": "<< cnts[i];
-            } else {
-                std::cout<<"UnknownID#"<<i <<": "<< cnts[i];
-            }
+    // --- 10) Print results ---
+    for (auto &kv : queryMap) {
+        const auto &kStr = kv.second;
+        const auto &cnts = resultCounts[kv.first];
+        std::cout << kStr << ": ";
+        bool first = true;
+        for (int i = 0; i < g_nIDs; i++) {
+            if (!first) std::cout << ", ";
+            first = false;
+            const std::string &nm =
+                (i < (int)g_genomeNames.size()
+                     ? g_genomeNames[i]
+                     : ("UnknownID#" + std::to_string(i)));
+            std::cout << nm << ": " << cnts[i];
         }
-        std::cout<<"\n";
+        std::cout << "\n";
     }
+
     return 0;
 }
+
+
+
 
 // -------------------------------------------------------------------------------------------
 // --query_regex => decode each k-mer, check if it matches the user-provided regex, collect
@@ -1745,13 +1709,13 @@ struct MatchedKmer {
 };
 
 static void workerThread_regex(int threadID,
-                               ThreadRange range,
-                               const std::string &binPath,
-                               const std::string &metaPath,
-                               const std::regex &re,
-                               std::vector<MatchedKmer> &outVec)
+        const std::vector<uint16_t> &p1List,
+        const std::string &binPath,
+        const std::string &metaPath,
+        const std::regex &re,
+        std::vector<MatchedKmer> &outVec)
 {
-    FinalBinReader reader(binPath, metaPath, g_k, range.p1Start, range.p1End);
+    FinalBinReader reader(binPath, metaPath, g_k, p1List);
     if(!reader.good()) return;
 
     bool haveCurr=false;
@@ -1852,31 +1816,30 @@ static int doQueryRegex(const std::string &binPath,
     std::regex re(pattern);
 
     // We'll do a multi-thread approach
-    int totalP1=(1<<P1_BITS);
-    int chunkSize=(totalP1+threads-1)/threads;
-    std::vector<ThreadRange> ranges(threads);
-    for(int i=0;i<threads;i++){
-        uint16_t st=(uint16_t)(i*chunkSize);
-        uint16_t ed=(uint16_t)std::min<int>((i+1)*chunkSize-1, totalP1-1);
-        ranges[i]={st,ed};
+    int totalP1 = (1<<P1_BITS);
+    int chunkSize = (totalP1 + threads - 1)/threads;
+    std::vector<std::vector<uint16_t>> p1Lists(threads);
+    for(int t=0; t<threads; t++){
+        int start = t*chunkSize;
+        int end   = std::min((t+1)*chunkSize, totalP1);
+        for(int p1 = start; p1 < end; ++p1)
+            p1Lists[t].push_back((uint16_t)p1);
     }
 
     // We'll store each thread's matched results in a separate vector, then combine
     std::vector<std::vector<MatchedKmer>> allThreadResults(threads);
 
     std::vector<std::thread> tvec;
-    for(int i=0;i<threads;i++){
+    for(int i=0; i<threads; i++){
         tvec.emplace_back(workerThread_regex,
                           i,
-                          ranges[i],
+                          std::cref(p1Lists[i]),
                           binPath,
                           metaPath,
                           std::cref(re),
                           std::ref(allThreadResults[i]));
     }
-    for(auto &th: tvec){
-        th.join();
-    }
+    for(auto &th: tvec) th.join();
 
     // combine
     // For simplicity, we won't reorder them. We'll just print them in the order found.
