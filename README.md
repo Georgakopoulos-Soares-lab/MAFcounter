@@ -228,7 +228,9 @@ Examples:
     --metadata_file ./final.metadata \
     --binary_database ./final.bin
 ```
-
+## Citation
+If you found this tool useful, please consider citing 
+Patsakis, M., Provatas, K., Karatzikos, A. et al. MAFcounter: an efficient tool for counting the occurrences of k-mers in MAF files. BMC Bioinformatics 26, 142 (2025). [https://doi.org/10.1186/s12859-025-06172-7](https://doi.org/10.1186/s12859-025-06172-7)
 
 ## Data used for benchmarks
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14927620.svg)](https://doi.org/10.5281/zenodo.14927620)
@@ -242,7 +244,5 @@ This project is licensed under the [GNU GPL v3](LICENSE).
 ## Contact
 
 For any questions or support, please contact 
-- izg5139@psu.edu
-- mpp5977@psu.edu 
-- kap6605@psu.edu
-- ioannis.mouratidis@psu.edu
+- ilias@austin.utexas.edu
+- ioannis.mouratidis@austin.utexas.edu
